@@ -1,0 +1,22 @@
+[package]
+name = "daxa-rs"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = ["glsl"]
+glsl = ["dep:glslang"]
+
+[[bin]]
+name = "hello-triangle-example"
+path = "src/example/hello_triangle.rs"
+
+[dependencies]
+bitflags = "2.6.0"
+daxa-sys = { path = "../daxa-sys" }
+derive_more = { version = "0.99.18", default-features = false, features = ["deref", "deref_mut", "into"] }
+raw-window-handle = "0.6.2"
+uuid = "1.10.0"
+winit = { version = "0.30.4", features = ["rwh_06"] }
+glslang = {version = "0.3", optional = true}
+lazy_static = "1.5.0"

@@ -1,0 +1,52 @@
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct daxa_AttachmentResolveInfo {
+    pub mode: VkResolveModeFlagBits,
+    pub image: daxa_ImageViewId,
+    pub layout: daxa_ImageLayout,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct daxa_RenderAttachmentInfo {
+    pub image_view: daxa_ImageViewId,
+    pub layout: daxa_ImageLayout,
+    pub load_op: VkAttachmentLoadOp,
+    pub store_op: VkAttachmentStoreOp,
+    pub clear_value: daxa_RenderAttachmentInfo__bindgen_ty_1,
+    pub resolve: daxa_RenderAttachmentInfo__bindgen_ty_2,
+}
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct daxa_RenderAttachmentInfo__bindgen_ty_1 {
+    pub values: VkClearValue,
+    pub index: u8,
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct daxa_ImageViewInfo {
+    pub type_: VkImageViewType,
+    pub format: VkFormat,
+    pub image: daxa_ImageId,
+    pub slice: daxa_ImageMipArraySlice,
+    pub name: daxa_SmallString,
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct daxa_ImageMipArraySlice {
+    pub base_mip_level: u32,
+    pub level_count: u32,
+    pub base_array_layer: u32,
+    pub layer_count: u32,
+}
+#[repr(u32)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+pub enum ImageViewType {
+    Type1d = 0,
+    Type2d = 1,
+    Type3d = 2,
+    TypeCube = 3,
+    Type1dArray = 4,
+    Type2dArray = 5,
+    TypeCubeArray = 6,
+}

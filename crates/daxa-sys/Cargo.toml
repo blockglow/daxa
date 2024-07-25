@@ -1,0 +1,12 @@
+[package]
+name = "daxa-sys"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+
+[build-dependencies]
+bindgen = "0.69.4"
+vcpkg = "0.2.15"
+cmake = "0.1.50"
+dotenvy = "0.15.7"

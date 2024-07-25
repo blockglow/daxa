@@ -1,0 +1,6 @@
+[submodule "lib/daxa"]
+	path = lib/daxa
+	url = https://github.com/ipotrick/daxa
+[submodule "lib/--force"]
+	path = lib/--force
+	url = https://github.com/ipotrick/daxa
