@@ -1,21 +1,34 @@
 #![feature(maybe_uninit_uninit_array)]
 
 use crate::device_selector::best_gpu;
+use crate::surface_format_selector::default_format_score;
 use bitflags::bitflags;
+use daxa_sys::{daxa_BinarySemaphore, daxa_Bool8, daxa_Device, daxa_ExecutableCommandList, daxa_ImageFlags, daxa_ImageUsageFlags, daxa_MemoryFlags, daxa_NativeWindowHandle, daxa_SmallString, daxa_TimelinePair, VkCompareOp, VkExtent3D, VkFormat, VkPipelineStageFlags};
 use derive_more::{Deref, DerefMut, Into};
+use glslang::error::GlslangError::ParseError;
+use glslang::include::{IncludeCallback, IncludeResult, IncludeType};
+use glslang::{
+    Compiler, CompilerOptions, GlslProfile, Program, Shader, ShaderInput, ShaderSource,
+    ShaderStage, SourceLanguage, SpirvVersion, Target, VulkanVersion,
+};
+use lazy_static::lazy_static;
+use raw_window_handle::{HasRawWindowHandle, HasWindowHandle, RawWindowHandle, WindowHandle};
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::convert::identity;
 use std::ffi::c_char;
-use std::{ffi, fmt, mem, ptr};
-use std::mem::{MaybeUninit, swap};
-use std::ops::Range;
-use std::path::PathBuf;
+use std::fmt::Formatter;
+use std::hash::{Hash, Hasher};
+use std::mem::{swap, MaybeUninit};
+use std::ops::{Bound, Range, RangeBounds};
+use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Arc;
+use std::rc::Rc;
 use std::sync::atomic::AtomicPtr;
-use raw_window_handle::{HasRawWindowHandle, HasWindowHandle, RawWindowHandle, WindowHandle};
+use std::sync::{Arc, Mutex};
+use std::{ffi, fmt, fs, mem, ptr, time};
+use std::cmp::PartialEq;
 use uuid::Uuid;
-use daxa_sys::{daxa_BinarySemaphore, daxa_Bool8, daxa_Device, daxa_ExecutableCommandList, daxa_NativeWindowHandle, daxa_TimelinePair, VkCompareOp, VkFormat, VkPipelineStageFlags};
-use crate::surface_format_selector::default_format_score;
 
 pub type Flags = u64;
 
@@ -93,7 +106,15 @@ impl Instance {
 
     pub fn create_device(&self, info: impl IntoDeviceInfo) -> Device {
         let Self(instance) = self;
-        let DeviceInfo { flags, max_allowed_buffers, max_allowed_acceleration_structures, max_allowed_images, max_allowed_samplers, selector, name } = info.into_device_info();
+        let DeviceInfo {
+            flags,
+            max_allowed_buffers,
+            max_allowed_acceleration_structures,
+            max_allowed_images,
+            max_allowed_samplers,
+            selector,
+            name,
+        } = info.into_device_info();
         let device = unsafe {
             let info = daxa_sys::daxa_DeviceInfo {
                 flags: flags.bits(),
@@ -105,7 +126,8 @@ impl Instance {
                 name: name.into(),
             };
             let mut device = MaybeUninit::uninit();
-            let result = daxa_sys::daxa_instance_create_device(*instance, &info, device.as_mut_ptr());
+            let result =
+                daxa_sys::daxa_instance_create_device(*instance, &info, device.as_mut_ptr());
             dbg!(result);
             device.assume_init()
         };
@@ -132,7 +154,6 @@ impl IntoDeviceInfo for DeviceSelector {
     }
 }
 pub type DeviceSelector = extern "C" fn(&DeviceProperties) -> DeviceScore;
-
 
 pub mod device_selector {
     use crate::{DeviceProperties, DeviceScore, DeviceType};
@@ -215,10 +236,10 @@ pub struct Optional<T> {
 
 impl<T: Copy> Clone for Optional<T> {
     fn clone(&self) -> Self {
-         Self {
-             value: self.value,
-             has_value: self.has_value
-         }
+        Self {
+            value: self.value,
+            has_value: self.has_value,
+        }
     }
 }
 
@@ -230,26 +251,34 @@ impl<T> Default for Optional<T> {
 
 impl<T> Optional<T> {
     fn as_option_ref(&self) -> Option<&T> {
-    self.has_value.then(|| unsafe {   self.value.assume_init_ref()
-    })
+        self.has_value
+            .then(|| unsafe { self.value.assume_init_ref() })
     }
     fn as_option_mut(&mut self) -> Option<&mut T> {
-       self.has_value.then(||  unsafe {   self.value.assume_init_mut()
-        })
+        self.has_value
+            .then(|| unsafe { self.value.assume_init_mut() })
     }
 }
 
 impl<T> From<Optional<T>> for Option<T> {
     fn from(value: Optional<T>) -> Self {
-        value.has_value.then(|| unsafe { value.value.assume_init() })
+        value
+            .has_value
+            .then(|| unsafe { value.value.assume_init() })
     }
 }
 
 impl<T> From<Option<T>> for Optional<T> {
     fn from(value: Option<T>) -> Self {
         match value {
-            Some(value) => Optional { value: MaybeUninit::new(value), has_value: true, },
-            None => Optional { value: MaybeUninit::uninit(), has_value: false }
+            Some(value) => Optional {
+                value: MaybeUninit::new(value),
+                has_value: true,
+            },
+            None => Optional {
+                value: MaybeUninit::uninit(),
+                has_value: false,
+            },
         }
     }
 }
@@ -464,10 +493,10 @@ bitflags! {
     }
 }
 
-
+#[derive(Clone)]
 pub struct Device(daxa_sys::daxa_Device);
 
-pub struct CommandRecorder(daxa_sys::daxa_CommandRecorder);
+pub struct CommandRecorder(daxa_sys::daxa_Device, daxa_sys::daxa_CommandRecorder);
 #[derive(Clone, Copy)]
 pub struct ExecutableCommandList(daxa_sys::daxa_ExecutableCommandList);
 
@@ -485,31 +514,206 @@ pub struct Viewport {
 }
 
 impl<'a> RenderPass<'a> {
+    pub fn assign_push_constant<T: Copy>(&self, push: &T) {
+        self.0.assign_push_constant(push)
+    }
     pub fn set_viewport(&self, viewport: &Viewport) {
-        unsafe { daxa_sys::daxa_cmd_set_viewport(self.0.0, viewport as *const _ as *const _); }
+        unsafe {
+            daxa_sys::daxa_cmd_set_viewport(self.0 .1, viewport as *const _ as *const _);
+        }
     }
     pub fn set_scissor(&self, scissor: &Rect) {
-        unsafe { daxa_sys::daxa_cmd_set_scissor(self.0.0, scissor as *const _ as *const _); }
+        unsafe {
+            daxa_sys::daxa_cmd_set_scissor(self.0 .1, scissor as *const _ as *const _);
+        }
     }
     pub fn bind_raster_pipeline(&self, raster_pipeline: &RasterPipeline) {
-        unsafe { daxa_sys::daxa_cmd_set_raster_pipeline(self.0.0, raster_pipeline.0); }
+        unsafe {
+            daxa_sys::daxa_cmd_set_raster_pipeline(self.0 .1, raster_pipeline.0);
+        }
     }
     pub fn draw(&self, indices: Range<u32>, instances: Range<u32>) {
-        unsafe { daxa_sys::daxa_cmd_draw(self.0.0, &daxa_sys::daxa_DrawInfo { vertex_count: indices.end - indices.start, instance_count: instances.end - instances.start, first_vertex: indices.start, first_instance: instances.start }) };
+        unsafe {
+            daxa_sys::daxa_cmd_draw(
+                self.0 .1,
+                &daxa_sys::daxa_DrawInfo {
+                    vertex_count: indices.end - indices.start,
+                    instance_count: instances.end - instances.start,
+                    first_vertex: indices.start,
+                    first_instance: instances.start,
+                },
+            )
+        };
     }
     pub fn end(self) {
-        unsafe { daxa_sys::daxa_cmd_end_renderpass(self.0.0) }
+        unsafe { daxa_sys::daxa_cmd_end_renderpass(self.0 .1) }
     }
 }
 
+bitflags! {
+    #[derive(Clone, Copy)]
+    pub struct AccessFlags: u32 {
+        const INDIRECT_COMMAND_READ = 0x00000001;
+        const INDEX_READ = 0x00000002;
+        const VERTEX_ATTRIBUTE_READ = 0x00000004;
+        const UNIFORM_READ = 0x00000008;
+        const INPUT_ATTACHMENT_READ = 0x00000010;
+        const SHADER_READ = 0x00000020;
+        const SHADER_WRITE = 0x00000040;
+        const COLOR_ATTACHMENT_READ = 0x00000080;
+        const COLOR_ATTACHMENT_WRITE = 0x00000100;
+        const DEPTH_STENCIL_ATTACHMENT_READ = 0x00000200;
+        const DEPTH_STENCIL_ATTACHMENT_WRITE = 0x00000400;
+        const TRANSFER_READ = 0x00000800;
+        const TRANSFER_WRITE = 0x00001000;
+        const HOST_READ = 0x00002000;
+        const HOST_WRITE = 0x00004000;
+        const MEMORY_READ = 0x00008000;
+        const MEMORY_WRITE = 0x00010000;
+        // Provided by VK_VERSION_1_3
+        const NONE = 0;
+        // Provided by VK_EXT_transform_feedback
+        const TRANSFORM_FEEDBACK_WRITE_EXT = 0x02000000;
+        // Provided by VK_EXT_transform_feedback
+        const TRANSFORM_FEEDBACK_COUNTER_READ_EXT = 0x04000000;
+        // Provided by VK_EXT_transform_feedback
+        const TRANSFORM_FEEDBACK_COUNTER_WRITE_EXT = 0x08000000;
+        // Provided by VK_EXT_conditional_rendering
+        const CONDITIONAL_RENDERING_READ_EXT = 0x00100000;
+        // Provided by VK_EXT_blend_operation_advanced
+        const COLOR_ATTACHMENT_READ_NONCOHERENT_EXT = 0x00080000;
+        // Provided by VK_KHR_acceleration_structure
+        const ACCELERATION_STRUCTURE_READ_KHR = 0x00200000;
+        // Provided by VK_KHR_acceleration_structure
+        const ACCELERATION_STRUCTURE_WRITE_KHR = 0x00400000;
+        // Provided by VK_EXT_fragment_density_map
+        const FRAGMENT_DENSITY_MAP_READ_EXT = 0x01000000;
+        // Provided by VK_KHR_fragment_shading_rate
+        const FRAGMENT_SHADING_RATE_ATTACHMENT_READ_KHR = 0x00800000;
+        // Provided by VK_NV_device_generated_commands
+        const COMMAND_PREPROCESS_READ_NV = 0x00020000;
+        // Provided by VK_NV_device_generated_commands
+        const COMMAND_PREPROCESS_WRITE_NV = 0x00040000;
+        // Provided by VK_NV_shading_rate_image
+        const SHADING_RATE_IMAGE_READ_NV = Self::FRAGMENT_SHADING_RATE_ATTACHMENT_READ_KHR.bits();
+        // Provided by VK_NV_ray_tracing
+        const ACCELERATION_STRUCTURE_READ_NV = Self::ACCELERATION_STRUCTURE_READ_KHR.bits();
+        // Provided by VK_NV_ray_tracing
+        const ACCELERATION_STRUCTURE_WRITE_NV = Self::ACCELERATION_STRUCTURE_WRITE_KHR.bits();
+        // Provided by VK_KHR_synchronization2
+        const NONE_KHR = Self::NONE.bits();
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct Access {
+    stage: PipelineStageFlags,
+    flags: AccessFlags,
+}
+
+#[derive(Clone, Copy)]
+pub enum PipelineBarrier {
+    Memory {
+        src: Access,
+        dst: Access,
+    },
+    ImageTransition {
+        src: (Access, ImageLayout),
+        dst: (Access, ImageLayout),
+        image_slice: ImageMipArraySlice,
+        image_id: ImageId,
+    },
+}
+
+pub struct BufferCopy {
+    pub src: BufferId,
+    pub dst: BufferId,
+    pub src_offset: usize,
+    pub dst_offset: usize,
+    pub size: usize,
+}
+
 impl CommandRecorder {
+    pub fn defer_destruct_image_view(&self, image_view_id: ImageViewId) {
+        unsafe {
+            daxa_sys::daxa_cmd_destroy_image_view_deferred(self.1, image_view_id.0);
+        }
+    }
+    pub fn assign_push_constant<T: Copy>(&self, push: &T) {
+        unsafe { 
+            daxa_sys::daxa_cmd_push_constant(self.1, &daxa_sys::daxa_PushConstantInfo {
+                data: push as *const _ as *const _,
+                size: mem::size_of::<T>() as u64,
+                offset: 0,
+            });
+        }
+    }
+    pub fn defer_destruct_buffer(&self, buffer_id: BufferId) {
+        unsafe {
+            daxa_sys::daxa_cmd_destroy_buffer_deferred(self.1, buffer_id.0);
+        }
+    }
+    pub fn copy_buffer_to_buffer(&self, buffer_copy: BufferCopy) {
+        unsafe {
+            daxa_sys::daxa_cmd_copy_buffer_to_buffer(self.1, &daxa_sys::daxa_BufferCopyInfo {
+                src_buffer: buffer_copy.src.0,
+                dst_buffer: buffer_copy.dst.0,
+                src_offset: buffer_copy.src_offset,
+                dst_offset: buffer_copy.dst_offset,
+                size: buffer_copy.size,
+            });
+        }
+    }
+    pub fn pipeline_barrier(&mut self, barrier: PipelineBarrier) {
+        match barrier {
+            PipelineBarrier::Memory { src, dst } => unsafe {
+                daxa_sys::daxa_cmd_pipeline_barrier(
+                    self.1,
+                    &daxa_sys::daxa_MemoryBarrierInfo {
+                        src_access: daxa_sys::daxa_Access {
+                            stages: src.stage.bits(),
+                            access_type: src.flags.bits() as _,
+                        },
+                        dst_access: daxa_sys::daxa_Access {
+                            stages: dst.stage.bits(),
+                            access_type: dst.flags.bits() as _,
+                        },
+                    },
+                )
+            },
+            PipelineBarrier::ImageTransition {
+                src: (src_access, src_layout),
+                dst: (dst_access, dst_layout),
+                image_slice,
+                image_id,
+            } => unsafe {
+                daxa_sys::daxa_cmd_pipeline_barrier_image_transition(
+                    self.1,
+                    &daxa_sys::daxa_ImageMemoryBarrierInfo {
+                        src_access: daxa_sys::daxa_Access {
+                            stages: src_access.stage.bits(),
+                            access_type: src_access.flags.bits() as _,
+                        },
+                        dst_access: daxa_sys::daxa_Access {
+                            stages: dst_access.stage.bits(),
+                            access_type: dst_access.flags.bits() as _,
+                        },
+                        src_layout: src_layout as _,
+                        dst_layout: dst_layout as _,
+                        image_slice: mem::transmute(image_slice),
+                        image_id: image_id.0,
+                    },
+                );
+            },
+        }
+    }
     pub fn begin_render_pass(&mut self, info: RenderPassBeginInfo) -> RenderPass {
-        let Self(cmd) = self;
+        let Self(_, cmd) = self;
         unsafe { daxa_sys::daxa_cmd_begin_renderpass(*cmd, &info as *const _ as *const _) };
         RenderPass(self)
     }
     pub fn complete(self) -> ExecutableCommandList {
-        let Self(recorder) = self;
+        let Self(_, recorder) = self;
         let exe = unsafe {
             let mut exe = MaybeUninit::uninit();
             daxa_sys::daxa_cmd_complete_current_commands(recorder, exe.as_mut_ptr());
@@ -524,7 +728,7 @@ pub struct RenderPassBeginInfo {
     pub color_attachments: FixedList<RenderAttachmentInfo, 8>,
     pub depth_attachment: Optional<RenderAttachmentInfo>,
     pub stencil_attachment: Optional<RenderAttachmentInfo>,
-    pub render_area: Rect
+    pub render_area: Rect,
 }
 
 #[derive(Clone, Copy)]
@@ -547,7 +751,7 @@ pub struct Extent<const D: usize> {
 
 #[repr(C)]
 pub struct CommandRecorderInfo {
-    name: SmallString
+    name: SmallString,
 }
 
 impl Default for CommandRecorderInfo {
@@ -567,6 +771,7 @@ pub struct ImageViewInfo {
     pub name: SmallString,
 }
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub struct ImageMipArraySlice {
     pub base_mip_level: u32,
     pub level_count: u32,
@@ -597,6 +802,7 @@ pub enum ImageViewType {
 
 bitflags! {
 
+    #[derive(Clone, Copy)]
     pub struct PipelineStageFlags: u64 {
         const NONE = 0;
         const TOP_OF_PIPE = 0x00000001;
@@ -655,6 +861,17 @@ pub struct BinarySemaphore(daxa_sys::daxa_BinarySemaphore);
 #[derive(Clone, Copy)]
 pub struct TimelinePair(daxa_sys::daxa_TimelinePair);
 
+pub struct TimelineSemaphore(daxa_sys::daxa_TimelineSemaphore);
+
+impl TimelinePair {
+    pub fn new(semaphore: TimelineSemaphore, value: u64) -> Self {
+        Self(daxa_sys::daxa_TimelinePair {
+            semaphore: semaphore.0,
+            value,
+        })
+    }
+}
+
 #[repr(C)]
 pub struct CommandSubmitInfo {
     pub wait_stages: PipelineStageFlags,
@@ -665,7 +882,7 @@ pub struct CommandSubmitInfo {
     pub signal_timeline_semaphores: FixedList<TimelinePair, 8>,
 }
 
-impl Default for CommandSubmitInfo{
+impl Default for CommandSubmitInfo {
     fn default() -> Self {
         Self {
             wait_stages: PipelineStageFlags::NONE,
@@ -673,7 +890,7 @@ impl Default for CommandSubmitInfo{
             wait_timeline_semaphores: Default::default(),
             wait_binary_semaphores: Default::default(),
             signal_timeline_semaphores: Default::default(),
-            signal_binary_semaphores: Default::default()
+            signal_binary_semaphores: Default::default(),
         }
     }
 }
@@ -683,51 +900,163 @@ pub struct PresentInfo {
     pub swapchain: Swapchain,
     pub wait_binary_semaphores: FixedList<BinarySemaphore, 8>,
 }
+
 pub struct BinarySemaphoreInfo {
+    pub name: SmallString,
+}
+
+
+bitflags! {
+    /// Memory flags
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub struct MemoryFlags: u32 {
+        /// No flags
+        const NONE = 0;
+        /// Dedicated memory
+        const DEDICATED_MEMORY = 0x00000001;
+        /// Memory can alias
+        const CAN_ALIAS = 0x00000200;
+        /// Host access with sequential writes
+        const HOST_ACCESS_SEQUENTIAL_WRITE = 0x00000400;
+        /// Host access with random access
+        const HOST_ACCESS_RANDOM = 0x00000800;
+        /// Strategy to minimize memory usage
+        const STRATEGY_MIN_MEMORY = 0x00010000;
+        /// Strategy to minimize time
+        const STRATEGY_MIN_TIME = 0x00020000;
+    }
+}
+
+bitflags! {
+    /// Image flags
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub struct ImageFlags: u32 {
+        /// No flags
+        const NONE = 0;
+        /// Allow mutable format
+        const ALLOW_MUTABLE_FORMAT = 8;
+        /// Compatible with cube images
+        const COMPATIBLE_CUBE = 16;
+        /// Compatible with 2D array images
+        const COMPATIBLE_2D_ARRAY = 32;
+        /// Allow image aliasing
+        const ALLOW_ALIAS = 1024;
+    }
+}
+
+pub struct BufferInfo {
+    pub size: usize,
+    pub memory_flags: MemoryFlags,
     pub name: SmallString
 }
 
+pub struct ImageInfo {
+    pub flags: ImageFlags,
+    pub dimensions: u32,
+    pub format: Format,
+    pub size: Extent<3>,
+    pub mip_level_count: u32,
+    pub array_layer_count: u32,
+    pub sample_count: u32,
+    pub usage: ImageUsage,
+    pub allocate_info: MemoryFlags,
+    pub name: SmallString,
+}
+
 impl Device {
+    pub fn host_access<'a, T>(&'a self, host_access_buffer_id: BufferId) -> &'a mut T {
+        let Self(device) = self;
+        unsafe {
+            let mut buffer_address = MaybeUninit::uninit();
+            daxa_sys::daxa_dvc_buffer_host_address(*device, host_access_buffer_id.0, buffer_address.as_mut_ptr());
+            buffer_address.assume_init().cast::<T>().as_mut().unwrap()
+        }
+    }
+    pub fn create_buffer(&self, info: BufferInfo) -> BufferId {
+        let Self(device) = self;
+        let buffer = unsafe {
+            let mut buffer_id = MaybeUninit::uninit();
+            daxa_sys::daxa_dvc_create_buffer(*device, &mut daxa_sys::daxa_BufferInfo {
+                size: info.size,
+                allocate_info: info.memory_flags.bits(),
+                name: info.name.into(),
+            }, buffer_id.as_mut_ptr());
+            buffer_id.assume_init()
+        };
+
+        BufferId(buffer)
+    }
+    pub fn create_image(&self, info: ImageInfo) -> ImageId {
+        let Self(device) = self;
+        let image = unsafe {
+            let mut image_id = MaybeUninit::uninit();
+            daxa_sys::daxa_dvc_create_image(*device, &mut mem::transmute(info), image_id.as_mut_ptr());
+            image_id.assume_init()
+
+        };
+        ImageId(image)
+    }
     pub fn create_binary_semaphore(&self, info: BinarySemaphoreInfo) -> BinarySemaphore {
         let Self(device) = self;
         let semaphore = unsafe {
             let mut semaphore = MaybeUninit::uninit();
-            daxa_sys::daxa_dvc_create_binary_semaphore(*device, &daxa_sys::daxa_BinarySemaphoreInfo {
-                name: info.name.into()
-            }, semaphore.as_mut_ptr());
+            daxa_sys::daxa_dvc_create_binary_semaphore(
+                *device,
+                &daxa_sys::daxa_BinarySemaphoreInfo {
+                    name: info.name.into(),
+                },
+                semaphore.as_mut_ptr(),
+            );
             semaphore.assume_init()
         };
         BinarySemaphore(semaphore)
     }
     pub fn present(&self, info: &PresentInfo) {
         let Self(device) = self;
-        unsafe { daxa_sys::daxa_dvc_present(*device, &daxa_sys::daxa_PresentInfo {
-            wait_binary_semaphores: info.wait_binary_semaphores.data.as_ptr() as *const _,
-            wait_binary_semaphore_count: info.wait_binary_semaphores.len as _,
-            swapchain: info.swapchain.0,
-        });}
+        unsafe {
+            daxa_sys::daxa_dvc_present(
+                *device,
+                &daxa_sys::daxa_PresentInfo {
+                    wait_binary_semaphores: info.wait_binary_semaphores.data.as_ptr() as *const _,
+                    wait_binary_semaphore_count: info.wait_binary_semaphores.len as _,
+                    swapchain: info.swapchain.0,
+                },
+            );
+        }
     }
     pub fn submit(&self, info: &CommandSubmitInfo) {
         let Self(device) = self;
-        unsafe { daxa_sys::daxa_dvc_submit(*device, &daxa_sys::daxa_CommandSubmitInfo {
-            wait_stages: 0,
-            command_lists: info.command_lists.data.as_ptr() as *const _,
-            command_list_count: info.command_lists.len as _,
-            wait_binary_semaphores: info.wait_binary_semaphores.data.as_ptr() as *const _,
-            wait_binary_semaphore_count: info.wait_binary_semaphores.len as _,
-            signal_binary_semaphores: info.signal_binary_semaphores.data.as_ptr() as *const _,
-            signal_binary_semaphore_count: info.signal_binary_semaphores.len as _,
-            wait_timeline_semaphores: info.wait_timeline_semaphores.data.as_ptr() as *const _,
-            wait_timeline_semaphore_count: info.wait_timeline_semaphores.len as _ ,
-            signal_timeline_semaphores: info.signal_timeline_semaphores.data.as_ptr() as *const _,
-            signal_timeline_semaphore_count: info.signal_timeline_semaphores.len as _,
-        });}
+        unsafe {
+            daxa_sys::daxa_dvc_submit(
+                *device,
+                &daxa_sys::daxa_CommandSubmitInfo {
+                    wait_stages: 0,
+                    command_lists: info.command_lists.data.as_ptr() as *const _,
+                    command_list_count: info.command_lists.len as _,
+                    wait_binary_semaphores: info.wait_binary_semaphores.data.as_ptr() as *const _,
+                    wait_binary_semaphore_count: info.wait_binary_semaphores.len as _,
+                    signal_binary_semaphores: info.signal_binary_semaphores.data.as_ptr()
+                        as *const _,
+                    signal_binary_semaphore_count: info.signal_binary_semaphores.len as _,
+                    wait_timeline_semaphores: info.wait_timeline_semaphores.data.as_ptr()
+                        as *const _,
+                    wait_timeline_semaphore_count: info.wait_timeline_semaphores.len as _,
+                    signal_timeline_semaphores: info.signal_timeline_semaphores.data.as_ptr()
+                        as *const _,
+                    signal_timeline_semaphore_count: info.signal_timeline_semaphores.len as _,
+                },
+            );
+        }
     }
     pub fn create_image_view(&self, info: ImageViewInfo) -> ImageViewId {
         let Self(device) = self;
         let image_view_id = unsafe {
             let mut image_view_id = MaybeUninit::uninit();
-            daxa_sys::daxa_dvc_create_image_view(*device, &info as *const  _ as *const _, image_view_id.as_mut_ptr());
+            daxa_sys::daxa_dvc_create_image_view(
+                *device,
+                &info as *const _ as *const _,
+                image_view_id.as_mut_ptr(),
+            );
             image_view_id.assume_init()
         };
         ImageViewId(image_view_id)
@@ -736,23 +1065,41 @@ impl Device {
         let Self(device) = self;
         let command_recorder = unsafe {
             let mut command_recorder = MaybeUninit::uninit();
-            daxa_sys::daxa_dvc_create_command_recorder(*device, &info as *const  _ as *const _, command_recorder.as_mut_ptr());
+            daxa_sys::daxa_dvc_create_command_recorder(
+                *device,
+                &info as *const _ as *const _,
+                command_recorder.as_mut_ptr(),
+            );
             command_recorder.assume_init()
         };
-        CommandRecorder(command_recorder)
+        CommandRecorder(device.clone(), command_recorder)
     }
     pub fn create_raster_pipeline(&self, info: RasterPipelineInfo) -> RasterPipeline {
         let Self(device) = self;
         let raster_pipeline = unsafe {
             let mut pipeline = MaybeUninit::uninit();
-            daxa_sys::daxa_dvc_create_raster_pipeline(*device, &info as *const _ as *const _, pipeline.as_mut_ptr());
+            daxa_sys::daxa_dvc_create_raster_pipeline(
+                *device,
+                &info as *const _ as *const _,
+                pipeline.as_mut_ptr(),
+            );
             pipeline.assume_init()
         };
         RasterPipeline(raster_pipeline)
     }
-    pub fn create_swapchain(&self, window: &impl HasWindowHandle, info: SwapchainInfo) -> Swapchain {
+    pub fn create_swapchain(
+        &self,
+        window: &impl HasWindowHandle,
+        info: SwapchainInfo,
+    ) -> Swapchain {
         let Self(device) = self;
-        let SwapchainInfo { surface_format_selector, present_operation, present_mode, image_usage, name} = info;
+        let SwapchainInfo {
+            surface_format_selector,
+            present_operation,
+            present_mode,
+            image_usage,
+            name,
+        } = info;
         let swapchain = unsafe {
             let info = daxa_sys::daxa_SwapchainInfo {
                 surface_format_selector: mem::transmute(surface_format_selector),
@@ -765,22 +1112,23 @@ impl Device {
             };
 
             let info = match window.raw_window_handle().unwrap() {
-                    RawWindowHandle::Xlib(mut handle) =>
-                    daxa_sys::daxa_SwapchainInfo {
-                        native_window: handle.window as *mut _,
-                        native_window_platform: daxa_sys::daxa_NativeWindowPlatform_DAXA_NATIVE_WINDOW_PLATFORM_XLIB_API,
-                        ..info
-                    },
-                RawWindowHandle::Wayland(mut handle) =>
-                    daxa_sys::daxa_SwapchainInfo {
-                        native_window: handle.surface.as_ptr(),
-                        native_window_platform: daxa_sys::daxa_NativeWindowPlatform_DAXA_NATIVE_WINDOW_PLATFORM_WAYLAND_API,
-                        ..info
-                    },
-                _ => todo!()
+                RawWindowHandle::Xlib(mut handle) => daxa_sys::daxa_SwapchainInfo {
+                    native_window: handle.window as *mut _,
+                    native_window_platform:
+                        daxa_sys::daxa_NativeWindowPlatform_DAXA_NATIVE_WINDOW_PLATFORM_XLIB_API,
+                    ..info
+                },
+                RawWindowHandle::Wayland(mut handle) => daxa_sys::daxa_SwapchainInfo {
+                    native_window: handle.surface.as_ptr(),
+                    native_window_platform:
+                        daxa_sys::daxa_NativeWindowPlatform_DAXA_NATIVE_WINDOW_PLATFORM_WAYLAND_API,
+                    ..info
+                },
+                _ => todo!(),
             };
             let mut swapchain = MaybeUninit::uninit();
-            let result = daxa_sys::daxa_dvc_create_swapchain(*device, &info, swapchain.as_mut_ptr());
+            let result =
+                daxa_sys::daxa_dvc_create_swapchain(*device, &info, swapchain.as_mut_ptr());
             dbg!(result);
             swapchain.assume_init()
         };
@@ -806,7 +1154,7 @@ pub type SurfaceFormatScore = i32;
 pub type SurfaceFormatSelector = extern "C" fn(Format) -> SurfaceFormatScore;
 
 pub struct SwapchainInfo {
-    surface_format_selector:  SurfaceFormatSelector,
+    surface_format_selector: SurfaceFormatSelector,
     present_mode: PresentMode,
     present_operation: SurfaceTransform,
     image_usage: ImageUsage,
@@ -814,19 +1162,19 @@ pub struct SwapchainInfo {
 }
 impl Default for SwapchainInfo {
     fn default() -> Self {
-       Self {
-           surface_format_selector: default_format_score,
-           present_mode: PresentMode::FifoKhr,
-           present_operation: SurfaceTransform::IDENTITY,
-           image_usage: ImageUsage::COLOR_ATTACHMENT,
-           name: b"swapchain".into()
-       }
+        Self {
+            surface_format_selector: default_format_score,
+            present_mode: PresentMode::MailboxKhr,
+            present_operation: SurfaceTransform::IDENTITY,
+            image_usage: ImageUsage::COLOR_ATTACHMENT,
+            name: b"swapchain".into(),
+        }
     }
 }
 pub mod surface_format_selector {
     use crate::{Format, SurfaceFormatScore};
 
-    pub extern "C" fn default_format_score(format: Format) -> SurfaceFormatScore{
+    pub extern "C" fn default_format_score(format: Format) -> SurfaceFormatScore {
         match format {
             Format::B8g8r8a8Unorm => 90,
             Format::R8g8b8a8Unorm => 80,
@@ -834,7 +1182,6 @@ pub mod surface_format_selector {
             Format::R8g8b8a8Srgb => 60,
             _ => 0,
         }
-
     }
 }
 
@@ -1133,8 +1480,22 @@ pub enum Format {
 pub struct Swapchain(daxa_sys::daxa_Swapchain);
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub struct ImageId(daxa_sys::daxa_ImageId);
 
+
+impl Hash for ImageId {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        state.write_u64(self.0.value);
+    }
+}
+
+impl PartialEq for ImageId {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.value.eq(&other.0.value)
+    }
+}
+impl Eq for ImageId {}
 impl Swapchain {
     pub fn acquire_next_image(&self) -> ImageId {
         unsafe {
@@ -1144,17 +1505,19 @@ impl Swapchain {
         }
     }
     pub fn current_present_semaphore(&self) -> BinarySemaphore {
-        unsafe {
-            BinarySemaphore(daxa_sys::daxa_swp_current_present_semaphore(self.0).read())
-        }
+        unsafe { BinarySemaphore(daxa_sys::daxa_swp_current_present_semaphore(self.0).read()) }
     }
     pub fn current_acquire_semaphore(&self) -> BinarySemaphore {
-        unsafe {
-            BinarySemaphore(daxa_sys::daxa_swp_current_acquire_semaphore(self.0).read())
-        }
+        unsafe { BinarySemaphore(daxa_sys::daxa_swp_current_acquire_semaphore(self.0).read()) }
+    }
+    pub fn gpu_timeline_semaphore(&self) -> TimelineSemaphore {
+        unsafe { TimelineSemaphore(daxa_sys::daxa_swp_gpu_timeline_semaphore(self.0).read() )}
+    }
+    pub fn current_cpu_timeline_value(&self) -> u64 {
+        unsafe { daxa_sys::daxa_swp_current_cpu_timeline_value(self.0)}
     }
     pub fn get_format(&self) -> Format {
-        unsafe { mem::transmute(daxa_sys::daxa_swp_get_format(self.0))}
+        unsafe { mem::transmute(daxa_sys::daxa_swp_get_format(self.0)) }
     }
 }
 // #[cfg(feature = "glsl")]
@@ -1248,6 +1611,10 @@ bitflags! {
     }
 }
 
+pub enum ShaderCompileInfo {
+    File(String),
+    Code(String),
+}
 #[repr(C)]
 pub struct ShaderInfo {
     pub byte_code: *const u32,
@@ -1334,17 +1701,19 @@ impl Default for BlendInfo {
             src_alpha_blend_factor: BlendFactor::One,
             dst_alpha_blend_factor: BlendFactor::Zero,
             alpha_blend_op: BlendOp::Add,
-            color_write_mask: ColorComponentFlags::R | ColorComponentFlags::G | ColorComponentFlags::B | ColorComponentFlags::A,
+            color_write_mask: ColorComponentFlags::R
+                | ColorComponentFlags::G
+                | ColorComponentFlags::B
+                | ColorComponentFlags::A,
         }
     }
 }
-
 
 #[repr(C)]
 #[derive(Default)]
 pub struct RenderAttachment {
     pub format: Format,
-    pub blend_info: Optional<BlendInfo>
+    pub blend_info: Optional<BlendInfo>,
 }
 
 #[repr(C)]
@@ -1384,7 +1753,7 @@ pub enum FrontFaceWinding {
 pub enum ConservativeRasterizationMode {
     Disabled = 0,
     Overestimate = 1,
-    Underestimate = 2
+    Underestimate = 2,
 }
 
 #[repr(C)]
@@ -1413,10 +1782,10 @@ pub struct RasterizerInfo {
 
 #[repr(u32)]
 pub enum RasterizationSamples {
-E1 = 0x00000001,
-E2 = 0x00000002,
-E4 = 0x00000004,
-E8 = 0x00000008,
+    E1 = 0x00000001,
+    E2 = 0x00000002,
+    E4 = 0x00000004,
+    E8 = 0x00000008,
 }
 
 #[repr(u32)]
@@ -1425,7 +1794,6 @@ pub enum TessellationDomainOrigin {
     UpperLeft = 0,
     LowerLeft = 1,
 }
-
 
 bitflags! {
     #[repr(transparent)]
@@ -1440,13 +1808,13 @@ bitflags! {
 #[repr(C)]
 pub struct TessellationInfo {
     control_points: u32,
-    origin: TessellationDomainOrigin
+    origin: TessellationDomainOrigin,
 }
 
 #[repr(C)]
 pub struct FixedList<T, const C: usize> {
     data: [MaybeUninit<T>; C],
-    len: u8
+    len: u8,
 }
 
 impl<T, const C: usize> Default for FixedList<T, C> {
@@ -1490,7 +1858,23 @@ pub struct RasterPipelineInfo {
     pub tessellation: Optional<TessellationInfo>,
     pub raster: RasterizerInfo,
     pub push_constant_size: u32,
-    pub name: SmallString
+    pub name: SmallString,
+}
+
+#[derive(Default)]
+pub struct RasterPipelineCompileInfo {
+    pub mesh_shader_info: Optional<ShaderCompileInfo>,
+    pub vertex_shader_info: Optional<ShaderCompileInfo>,
+    pub tesselation_control_shader_info: Optional<ShaderCompileInfo>,
+    pub tesselation_evaluation_shader_info: Optional<ShaderCompileInfo>,
+    pub fragment_shader_info: Optional<ShaderCompileInfo>,
+    pub task_shader_info: Optional<ShaderCompileInfo>,
+    pub color_attachments: FixedList<RenderAttachment, 8>,
+    pub depth_test: Optional<DepthTestInfo>,
+    pub tessellation: Optional<TessellationInfo>,
+    pub raster: RasterizerInfo,
+    pub push_constant_size: u32,
+    pub name: SmallString,
 }
 
 impl Default for RasterizerInfo {
@@ -1532,7 +1916,309 @@ impl Default for SmallString {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct RasterPipeline(daxa_sys::daxa_RasterPipeline);
+
+lazy_static! {
+    pub static ref GLSLANG_FILE_INCLUDER: Arc<Mutex<GlslangFileIncluder>> =
+        Arc::new(Mutex::new(GlslangFileIncluder::default()));
+}
+
+type Header = String;
+type Contents = String;
+
+#[derive(Default)]
+pub struct GlslangFileIncluder {
+    virtual_files: HashMap<Header, Contents>,
+    current_observed_hotload_files: HashMap<Header, time::Instant>,
+    include_directories: Vec<PathBuf>,
+}
+
+impl GlslangFileIncluder {
+    const MAX_INCLUSION_DEPTH: usize = 100;
+    fn include(
+        ty: IncludeType,
+        header_name: &str,
+        includer_name: &str,
+        inclusion_depth: usize,
+    ) -> Option<IncludeResult> {
+        if inclusion_depth > Self::MAX_INCLUSION_DEPTH {
+            None?
+        }
+
+        let mut this = GLSLANG_FILE_INCLUDER.lock().unwrap();
+
+        if this.virtual_files.contains_key(header_name) {
+            return Self::process(
+                header_name.to_string(),
+                this.virtual_files[header_name].clone(),
+            );
+        }
+
+        let Some(full_path) = Self::full_path_to_file(&this.include_directories, header_name)
+        else {
+            None?
+        };
+
+        let mut contents = Self::load_shader_source_from_file(&full_path);
+
+        this.virtual_files
+            .insert(header_name.to_string(), contents.clone());
+
+        return Self::process(full_path.to_str().unwrap().to_string(), contents);
+    }
+
+    fn process(name: String, contents: String) -> Option<IncludeResult> {
+        let contents = contents.replace("#pragma once", "");
+        Some(IncludeResult {
+            name: name.into(),
+            data: contents,
+        })
+    }
+
+    fn full_path_to_file(include_directories: &[PathBuf], name: &str) -> Option<PathBuf> {
+        include_directories
+            .iter()
+            .map(|dir| {
+                let mut potential_path = dir.clone();
+                potential_path.push(name);
+                potential_path
+            })
+            .map(|x| dbg!(x))
+            .filter(|path| fs::metadata(&path).is_ok())
+            .next()
+    }
+
+    fn load_shader_source_from_file(path: &Path) -> String {
+        fs::read_to_string(path).unwrap()
+    }
+}
+
+pub struct PipelineCompilerInfo {
+    pub include_dirs: Vec<PathBuf>,
+}
+
+//this would be more performant as a Rc<RefCell<T>> but it would be annoying to work with
+//in many situations
+#[derive(Clone)]
+pub struct PipelineCompiler(Arc<Mutex<PipelineCompilerInner>>);
+
+pub enum ShaderCode {
+    Vertex(String),
+    Fragment(String),
+}
+
+impl fmt::Display for ShaderCode {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        writeln!(f, "#extension GL_GOOGLE_include_directive : require")?;
+        match self {
+            Self::Vertex(_) => writeln!(f, "#define DAXA_SHADER_STAGE DAXA_SHADER_STAGE_VERTEX")?,
+            Self::Fragment(_) => {
+                writeln!(f, "#define DAXA_SHADER_STAGE DAXA_SHADER_STAGE_FRAGMENT")?
+            }
+        }
+        writeln!(
+            f,
+            "{}",
+            match self {
+                Self::Vertex(s) => s,
+                Self::Fragment(s) => s,
+            }
+        )
+    }
+}
+
+impl ShaderCode {
+    fn to_stage(&self) -> ShaderStage {
+        match self {
+            Self::Vertex(_) => ShaderStage::Vertex,
+            Self::Fragment(_) => ShaderStage::Fragment,
+        }
+    }
+}
+
+impl<T: ToString> From<(T, ShaderStage)> for ShaderCode {
+    fn from((t, s): (T, ShaderStage)) -> Self {
+        match s {
+            ShaderStage::Vertex => Self::Vertex(t.to_string()),
+            ShaderStage::Fragment => Self::Fragment(t.to_string()),
+            _ => todo!(),
+        }
+    }
+}
+
+fn shader(shader_code: ShaderCode) -> Vec<u32> {
+    let compiler = Compiler::acquire().expect("Failed to acquire compiler");
+    let opts = CompilerOptions {
+        source_language: SourceLanguage::GLSL,
+        target: Target::Vulkan {
+            version: VulkanVersion::Vulkan1_3,
+            spirv_version: SpirvVersion::SPIRV1_6,
+        },
+        version_profile: Some((460, GlslProfile::None)),
+    };
+
+    let includer = Some(GlslangFileIncluder::include as IncludeCallback);
+
+    // Compile vertex shader
+    let vertex_shader_source =
+        ShaderSource::try_from(shader_code.to_string()).expect("shader source");
+    let vertex_shader_input = ShaderInput::new(
+        &vertex_shader_source,
+        shader_code.to_stage(),
+        &opts,
+        includer,
+    )
+    .unwrap();
+    let vertex_shader = match Shader::new(&compiler, vertex_shader_input) {
+        Ok(s) => s,
+        Err(ParseError(s)) => panic!("{s}"),
+        _ => unreachable!(),
+    };
+
+    // Create shader program and link shaders
+    let mut program = Program::new(&compiler);
+    program.add_shader(&vertex_shader);
+
+    // Compile shaders to bytecode
+    let bytecode = program
+        .compile(shader_code.to_stage())
+        .expect("Vertex shader bytecode");
+
+    bytecode
+}
+
+impl PipelineCompiler {
+    pub fn acquire(device: &Device, info: PipelineCompilerInfo) -> Self {
+        for include_dir in info.include_dirs.clone() {
+            GLSLANG_FILE_INCLUDER
+                .lock()
+                .unwrap()
+                .include_directories
+                .push(include_dir);
+        }
+        Self(Arc::new(Mutex::new(PipelineCompilerInner {
+            raster: HashMap::default(),
+            include_directories: info.include_dirs,
+            daxa_device: device.0,
+        })))
+    }
+
+    pub fn load_shader(include_directories: &[PathBuf], name: impl AsRef<str>) -> String {
+        let name = name.as_ref();
+        for dir in include_directories {
+            let mut path = dir.clone();
+            path.push(name.to_string());
+            dbg!(&path);
+            let exists = fs::metadata(path.clone()).is_ok();
+            if exists {
+                return fs::read_to_string(path).unwrap();
+            }
+        }
+        panic!("could not find shader {name}")
+    }
+
+    pub fn compile_raster_pipeline(&self, info: RasterPipelineCompileInfo) -> RasterPipelineHandle {
+        let PipelineCompiler(mutex) = &self;
+        let mut compiler = mutex.lock().unwrap();
+        let RasterPipelineCompileInfo {
+            mesh_shader_info,
+            vertex_shader_info,
+            tesselation_control_shader_info,
+            tesselation_evaluation_shader_info,
+            fragment_shader_info,
+            task_shader_info,
+            color_attachments,
+            depth_test,
+            tessellation,
+            raster,
+            push_constant_size,
+            name,
+        } = info;
+
+        let mut shader_codes = vec![];
+
+        let mut compile = |shader_compile_info: ShaderCompileInfo, shader_stage: ShaderStage| {
+            let code = match shader_compile_info {
+                ShaderCompileInfo::File(name) => {
+                    Self::load_shader(&compiler.include_directories, name)
+                }
+                ShaderCompileInfo::Code(code) => code.to_owned(),
+            };
+
+            let code = ShaderCode::from((code, shader_stage));
+
+            shader_codes.push(shader(code));
+
+            ShaderInfo {
+                byte_code: shader_codes.last().unwrap().as_ptr(),
+                byte_code_size: shader_codes.last().unwrap().len() as _,
+                create_flags: PipelineShaderStageCreateFlags::empty(),
+                required_subgroup_size: Default::default(),
+                entry_point: b"main".into(),
+            }
+        };
+
+        let info = RasterPipelineInfo {
+            mesh_shader_info: Option::from(mesh_shader_info)
+                .map(|x| compile(x, ShaderStage::Mesh))
+                .into(),
+            vertex_shader_info: Option::from(vertex_shader_info)
+                .map(|x| compile(x, ShaderStage::Vertex))
+                .into(),
+            tesselation_control_shader_info: Option::from(tesselation_control_shader_info)
+                .map(|x| compile(x, ShaderStage::TesselationControl))
+                .into(),
+            tesselation_evaluation_shader_info: Option::from(tesselation_evaluation_shader_info)
+                .map(|x| compile(x, ShaderStage::TesselationEvaluation))
+                .into(),
+            fragment_shader_info: Option::from(fragment_shader_info)
+                .map(|x| compile(x, ShaderStage::Fragment))
+                .into(),
+            task_shader_info: Option::from(task_shader_info)
+                .map(|x| compile(x, ShaderStage::Task))
+                .into(),
+            color_attachments,
+            depth_test,
+            tessellation,
+            raster,
+            push_constant_size,
+            name,
+        };
+
+        //magical construction of daxa-rs device
+        let raster_pipeline = Device(compiler.daxa_device).create_raster_pipeline(info);
+
+        let raster_index = compiler.raster.len() as u64;
+
+        compiler.raster.insert(raster_index, raster_pipeline);
+
+        RasterPipelineHandle {
+            id: raster_index,
+            compiler: self.clone(),
+        }
+    }
+}
+
+pub struct PipelineCompilerInner {
+    raster: HashMap<u64, RasterPipeline>,
+    include_directories: Vec<PathBuf>,
+    daxa_device: daxa_sys::daxa_Device,
+}
+
+#[derive(Clone)]
+pub struct RasterPipelineHandle {
+    compiler: PipelineCompiler,
+    id: u64,
+}
+
+impl RasterPipelineHandle {
+    pub fn pipeline(&self) -> RasterPipeline {
+        let PipelineCompiler(mutex) = &self.compiler;
+        let compiler = mutex.lock().unwrap();
+        compiler.raster[&self.id].clone()
+    }
+}
 
 unsafe impl Send for RasterPipeline {}
 unsafe impl Sync for RasterPipeline {}
@@ -1540,6 +2226,18 @@ unsafe impl Sync for RasterPipeline {}
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct ImageViewId(daxa_sys::daxa_ImageViewId);
+impl Hash for ImageViewId {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        state.write_u64(self.0.value);
+    }
+}
+
+impl PartialEq for ImageViewId {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.value.eq(&other.0.value)
+    }
+}
+impl Eq for ImageViewId {}
 
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -1548,6 +2246,76 @@ pub struct AttachmentResolveInfo {
     pub image: ImageViewId,
     pub layout: ImageLayout,
 }
+
+impl From<ImageAccess> for ImageLayout {
+    fn from(image_access: ImageAccess) -> Self {
+        match image_access {
+            ImageAccess::None => ImageLayout::Undefined,
+            ImageAccess::GraphicsShaderSampled => ImageLayout::ShaderReadOnlyOptimal,
+            ImageAccess::GraphicsShaderStorageWriteOnly => ImageLayout::General,
+            ImageAccess::GraphicsShaderStorageReadOnly => ImageLayout::General,
+            ImageAccess::GraphicsShaderStorageReadWrite => ImageLayout::General,
+            ImageAccess::GraphicsShaderStorageReadWriteConcurrent => ImageLayout::General,
+            ImageAccess::ComputeShaderSampled => ImageLayout::ShaderReadOnlyOptimal,
+            ImageAccess::ComputeShaderStorageWriteOnly => ImageLayout::General,
+            ImageAccess::ComputeShaderStorageReadOnly => ImageLayout::General,
+            ImageAccess::ComputeShaderStorageReadWrite => ImageLayout::General,
+            ImageAccess::ComputeShaderStorageReadWriteConcurrent => ImageLayout::General,
+            ImageAccess::RayTracingShaderSampled => ImageLayout::ShaderReadOnlyOptimal,
+            ImageAccess::RayTracingShaderStorageWriteOnly => ImageLayout::General,
+            ImageAccess::RayTracingShaderStorageReadOnly => ImageLayout::General,
+            ImageAccess::RayTracingShaderStorageReadWrite => ImageLayout::General,
+            ImageAccess::RayTracingShaderStorageReadWriteConcurrent => ImageLayout::General,
+            ImageAccess::TaskShaderSampled => ImageLayout::ShaderReadOnlyOptimal,
+            ImageAccess::TaskShaderStorageWriteOnly => ImageLayout::General,
+            ImageAccess::TaskShaderStorageReadOnly => ImageLayout::General,
+            ImageAccess::TaskShaderStorageReadWrite => ImageLayout::General,
+            ImageAccess::TaskShaderStorageReadWriteConcurrent => ImageLayout::General,
+            ImageAccess::MeshShaderSampled => ImageLayout::ShaderReadOnlyOptimal,
+            ImageAccess::MeshShaderStorageWriteOnly => ImageLayout::General,
+            ImageAccess::MeshShaderStorageReadOnly => ImageLayout::General,
+            ImageAccess::MeshShaderStorageReadWrite => ImageLayout::General,
+            ImageAccess::MeshShaderStorageReadWriteConcurrent => ImageLayout::General,
+            ImageAccess::VertexShaderSampled => ImageLayout::ShaderReadOnlyOptimal,
+            ImageAccess::VertexShaderStorageWriteOnly => ImageLayout::General,
+            ImageAccess::VertexShaderStorageReadOnly => ImageLayout::General,
+            ImageAccess::VertexShaderStorageReadWrite => ImageLayout::General,
+            ImageAccess::VertexShaderStorageReadWriteConcurrent => ImageLayout::General,
+            ImageAccess::TessellationControlShaderSampled => ImageLayout::ShaderReadOnlyOptimal,
+            ImageAccess::TessellationControlShaderStorageWriteOnly => ImageLayout::General,
+            ImageAccess::TessellationControlShaderStorageReadOnly => ImageLayout::General,
+            ImageAccess::TessellationControlShaderStorageReadWrite => ImageLayout::General,
+            ImageAccess::TessellationControlShaderStorageReadWriteConcurrent => ImageLayout::General,
+            ImageAccess::TessellationEvaluationShaderSampled => ImageLayout::ShaderReadOnlyOptimal,
+            ImageAccess::TessellationEvaluationShaderStorageWriteOnly => ImageLayout::General,
+            ImageAccess::TessellationEvaluationShaderStorageReadOnly => ImageLayout::General,
+            ImageAccess::TessellationEvaluationShaderStorageReadWrite => ImageLayout::General,
+            ImageAccess::TessellationEvaluationShaderStorageReadWriteConcurrent => ImageLayout::General,
+            ImageAccess::GeometryShaderSampled => ImageLayout::ShaderReadOnlyOptimal,
+            ImageAccess::GeometryShaderStorageWriteOnly => ImageLayout::General,
+            ImageAccess::GeometryShaderStorageReadOnly => ImageLayout::General,
+            ImageAccess::GeometryShaderStorageReadWrite => ImageLayout::General,
+            ImageAccess::GeometryShaderStorageReadWriteConcurrent => ImageLayout::General,
+            ImageAccess::FragmentShaderSampled => ImageLayout::ShaderReadOnlyOptimal,
+            ImageAccess::FragmentShaderStorageWriteOnly => ImageLayout::General,
+            ImageAccess::FragmentShaderStorageReadOnly => ImageLayout::General,
+            ImageAccess::FragmentShaderStorageReadWrite => ImageLayout::General,
+            ImageAccess::FragmentShaderStorageReadWriteConcurrent => ImageLayout::General,
+            ImageAccess::TransferRead => ImageLayout::TransferSrcOptimal,
+            ImageAccess::TransferWrite => ImageLayout::TransferDstOptimal,
+            ImageAccess::ColorAttachment => ImageLayout::ColorAttachmentOptimal,
+            ImageAccess::DepthAttachment => ImageLayout::DepthStencilAttachmentOptimal,
+            ImageAccess::StencilAttachment => ImageLayout::DepthStencilAttachmentOptimal,
+            ImageAccess::DepthStencilAttachment => ImageLayout::DepthStencilAttachmentOptimal,
+            ImageAccess::DepthAttachmentRead => ImageLayout::DepthStencilReadOnlyOptimal,
+            ImageAccess::StencilAttachmentRead => ImageLayout::DepthStencilReadOnlyOptimal,
+            ImageAccess::DepthStencilAttachmentRead => ImageLayout::DepthStencilReadOnlyOptimal,
+            ImageAccess::ResolveWrite => ImageLayout::ColorAttachmentOptimal,
+            ImageAccess::Present => ImageLayout::PresentSrcKhr,
+        }
+    }
+}
+
 
 #[repr(u32)]
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
@@ -1580,7 +2348,7 @@ pub enum ImageLayout {
     VideoEncodeDstKhr = 1000299000,
     VideoEncodeSrcKhr = 1000299001,
     VideoEncodeDpbKhr = 1000299002,
-    AttachmentFeedbackLoopOptimalExt = 1000339000
+    AttachmentFeedbackLoopOptimalExt = 1000339000,
 }
 
 #[repr(C)]
@@ -1615,11 +2383,11 @@ pub enum AttachmentLoadOp {
 #[derive(Copy, Clone)]
 pub union ClearValue {
     pub color: ClearColorValue,
-    depth_stencil: ClearDepthStencilValue
+    depth_stencil: ClearDepthStencilValue,
 }
 
 #[repr(C)]
-#[derive( Copy, Clone)]
+#[derive(Copy, Clone)]
 pub union ClearColorValue {
     pub float32: [f32; 4],
     pub int32: [i32; 4],
@@ -1631,4 +2399,1554 @@ pub union ClearColorValue {
 struct ClearDepthStencilValue {
     depth: f32,
     stencil: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct BufferId(daxa_sys::daxa_BufferId);
+
+impl Hash for BufferId {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        state.write_u64(self.0.value);
+    }
+}
+
+impl PartialEq for BufferId {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.value.eq(&other.0.value)
+    }
+}
+impl Eq for BufferId {}
+#[derive(Clone)]
+pub struct TaskBuffer(Arc<Mutex<Vec<BufferId>>>);
+impl TaskBuffer {
+    pub fn new(iter: impl IntoIterator<Item = BufferId>) -> Self {
+        Self(Arc::new(Mutex::new(iter.into_iter().collect())))
+    }
+    pub fn set(&mut self, iter: impl IntoIterator<Item = BufferId>) {
+        let Self(mutex) = self;
+        *mutex.lock().unwrap() = iter.into_iter().collect();
+    }
+    pub fn buffer_ids(&self) -> impl IntoIterator<Item = BufferId> {
+        let Self(mutex) = self;
+        mutex.lock().unwrap().clone()
+    }
+}
+#[derive(Clone)]
+pub struct TaskImage(Arc<Mutex<Vec<ImageId>>>);
+impl TaskImage {
+    pub fn new(iter: impl IntoIterator<Item = ImageId>) -> Self {
+        Self(Arc::new(Mutex::new(iter.into_iter().collect())))
+    }
+    pub fn set(&mut self, iter: impl IntoIterator<Item = ImageId>) {
+        let Self(mutex) = self;
+        *mutex.lock().unwrap() = iter.into_iter().collect();
+    }
+    pub fn image_ids(&self) -> impl IntoIterator<Item = ImageId> {
+        let Self(mutex) = self;
+        mutex.lock().unwrap().clone()
+    }
+}
+
+pub enum Use<'a> {
+    Buffer(&'a TaskBuffer, MemoryAccess),
+    Image(&'a TaskImage, ImageAccess),
+}
+
+impl Use<'_> {
+    fn buffer(&self) -> (&TaskBuffer, MemoryAccess) {
+        let Self::Buffer(t, m) = self else {
+            unreachable!();
+        };
+        (t, *m)
+    }
+    fn image(&self) -> (&TaskImage, ImageAccess) {
+        let Self::Image(t, m) = self else {
+            unreachable!();
+        };
+        (t, *m)
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MemoryAccess {
+    None,
+    Read,
+    Write,
+    ReadWrite,
+    GraphicsShaderRead,
+    GraphicsShaderWrite,
+    GraphicsShaderReadWrite,
+    GraphicsShaderReadWriteConcurrent,
+    ComputeShaderRead,
+    ComputeShaderWrite,
+    ComputeShaderReadWrite,
+    ComputeShaderReadWriteConcurrent,
+    RayTracingShaderRead,
+    RayTracingShaderWrite,
+    RayTracingShaderReadWrite,
+    RayTracingShaderReadWriteConcurrent,
+    TaskShaderRead,
+    TaskShaderWrite,
+    TaskShaderReadWrite,
+    TaskShaderReadWriteConcurrent,
+    MeshShaderRead,
+    MeshShaderWrite,
+    MeshShaderReadWrite,
+    MeshShaderReadWriteConcurrent,
+    VertexShaderRead,
+    VertexShaderWrite,
+    VertexShaderReadWrite,
+    VertexShaderReadWriteConcurrent,
+    TessellationControlShaderRead,
+    TessellationControlShaderWrite,
+    TessellationControlShaderReadWrite,
+    TessellationControlShaderReadWriteConcurrent,
+    TessellationEvaluationShaderRead,
+    TessellationEvaluationShaderWrite,
+    TessellationEvaluationShaderReadWrite,
+    TessellationEvaluationShaderReadWriteConcurrent,
+    GeometryShaderRead,
+    GeometryShaderWrite,
+    GeometryShaderReadWrite,
+    GeometryShaderReadWriteConcurrent,
+    FragmentShaderRead,
+    FragmentShaderWrite,
+    FragmentShaderReadWrite,
+    FragmentShaderReadWriteConcurrent,
+    IndexRead,
+    DrawIndirectInfoRead,
+    TransferRead,
+    TransferWrite,
+    HostTransferRead,
+    HostTransferWrite,
+    AccelerationStructureBuildRead,
+    AccelerationStructureBuildWrite,
+    AccelerationStructureBuildReadWrite,
+}
+
+impl From<MemoryAccess> for Access {
+    fn from(memory_access: MemoryAccess) -> Self {
+        match memory_access {
+            MemoryAccess::None => Access {
+                stage: PipelineStageFlags::NONE,
+                flags: AccessFlags::NONE,
+            },
+            MemoryAccess::Read => Access {
+                stage: PipelineStageFlags::ALL_COMMANDS,
+                flags: AccessFlags::MEMORY_READ,
+            },
+            MemoryAccess::Write => Access {
+                stage: PipelineStageFlags::ALL_COMMANDS,
+                flags: AccessFlags::MEMORY_WRITE,
+            },
+            MemoryAccess::ReadWrite => Access {
+                stage: PipelineStageFlags::ALL_COMMANDS,
+                flags: AccessFlags::MEMORY_READ | AccessFlags::MEMORY_WRITE,
+            },
+            MemoryAccess::GraphicsShaderRead => Access {
+                stage: PipelineStageFlags::ALL_GRAPHICS,
+                flags: AccessFlags::SHADER_READ,
+            },
+            MemoryAccess::GraphicsShaderWrite => Access {
+                stage: PipelineStageFlags::ALL_GRAPHICS,
+                flags: AccessFlags::SHADER_WRITE,
+            },
+            MemoryAccess::GraphicsShaderReadWrite => Access {
+                stage: PipelineStageFlags::ALL_GRAPHICS,
+                flags: AccessFlags::SHADER_READ | AccessFlags::SHADER_WRITE,
+            },
+            MemoryAccess::GraphicsShaderReadWriteConcurrent => Access {
+                stage: PipelineStageFlags::ALL_GRAPHICS,
+                flags: AccessFlags::SHADER_READ | AccessFlags::SHADER_WRITE,
+            },
+            MemoryAccess::ComputeShaderRead => Access {
+                stage: PipelineStageFlags::COMPUTE_SHADER,
+                flags: AccessFlags::SHADER_READ,
+            },
+            MemoryAccess::ComputeShaderWrite => Access {
+                stage: PipelineStageFlags::COMPUTE_SHADER,
+                flags: AccessFlags::SHADER_WRITE,
+            },
+            MemoryAccess::ComputeShaderReadWrite => Access {
+                stage: PipelineStageFlags::COMPUTE_SHADER,
+                flags: AccessFlags::SHADER_READ | AccessFlags::SHADER_WRITE,
+            },
+            MemoryAccess::ComputeShaderReadWriteConcurrent => Access {
+                stage: PipelineStageFlags::COMPUTE_SHADER,
+                flags: AccessFlags::SHADER_READ | AccessFlags::SHADER_WRITE,
+            },
+            MemoryAccess::RayTracingShaderRead => Access {
+                stage: PipelineStageFlags::RAY_TRACING_SHADER_KHR,
+                flags: AccessFlags::SHADER_READ,
+            },
+            MemoryAccess::RayTracingShaderWrite => Access {
+                stage: PipelineStageFlags::RAY_TRACING_SHADER_KHR,
+                flags: AccessFlags::SHADER_WRITE,
+            },
+            MemoryAccess::RayTracingShaderReadWrite => Access {
+                stage: PipelineStageFlags::RAY_TRACING_SHADER_KHR,
+                flags: AccessFlags::SHADER_READ | AccessFlags::SHADER_WRITE,
+            },
+            MemoryAccess::RayTracingShaderReadWriteConcurrent => Access {
+                stage: PipelineStageFlags::RAY_TRACING_SHADER_KHR,
+                flags: AccessFlags::SHADER_READ | AccessFlags::SHADER_WRITE,
+            },
+            MemoryAccess::TaskShaderRead => Access {
+                stage: PipelineStageFlags::TASK_SHADER_NV,
+                flags: AccessFlags::SHADER_READ,
+            },
+            MemoryAccess::TaskShaderWrite => Access {
+                stage: PipelineStageFlags::TASK_SHADER_NV,
+                flags: AccessFlags::SHADER_WRITE,
+            },
+            MemoryAccess::TaskShaderReadWrite => Access {
+                stage: PipelineStageFlags::TASK_SHADER_NV,
+                flags: AccessFlags::SHADER_READ | AccessFlags::SHADER_WRITE,
+            },
+            MemoryAccess::TaskShaderReadWriteConcurrent => Access {
+                stage: PipelineStageFlags::TASK_SHADER_NV,
+                flags: AccessFlags::SHADER_READ | AccessFlags::SHADER_WRITE,
+            },
+            MemoryAccess::MeshShaderRead => Access {
+                stage: PipelineStageFlags::MESH_SHADER_NV,
+                flags: AccessFlags::SHADER_READ,
+            },
+            MemoryAccess::MeshShaderWrite => Access {
+                stage: PipelineStageFlags::MESH_SHADER_NV,
+                flags: AccessFlags::SHADER_WRITE,
+            },
+            MemoryAccess::MeshShaderReadWrite => Access {
+                stage: PipelineStageFlags::MESH_SHADER_NV,
+                flags: AccessFlags::SHADER_READ | AccessFlags::SHADER_WRITE,
+            },
+            MemoryAccess::MeshShaderReadWriteConcurrent => Access {
+                stage: PipelineStageFlags::MESH_SHADER_NV,
+                flags: AccessFlags::SHADER_READ | AccessFlags::SHADER_WRITE,
+            },
+            MemoryAccess::VertexShaderRead => Access {
+                stage: PipelineStageFlags::VERTEX_SHADER,
+                flags: AccessFlags::SHADER_READ,
+            },
+            MemoryAccess::VertexShaderWrite => Access {
+                stage: PipelineStageFlags::VERTEX_SHADER,
+                flags: AccessFlags::SHADER_WRITE,
+            },
+            MemoryAccess::VertexShaderReadWrite => Access {
+                stage: PipelineStageFlags::VERTEX_SHADER,
+                flags: AccessFlags::SHADER_READ | AccessFlags::SHADER_WRITE,
+            },
+            MemoryAccess::VertexShaderReadWriteConcurrent => Access {
+                stage: PipelineStageFlags::VERTEX_SHADER,
+                flags: AccessFlags::SHADER_READ | AccessFlags::SHADER_WRITE,
+            },
+            MemoryAccess::TessellationControlShaderRead => Access {
+                stage: PipelineStageFlags::TESSELLATION_CONTROL_SHADER,
+                flags: AccessFlags::SHADER_READ,
+            },
+            MemoryAccess::TessellationControlShaderWrite => Access {
+                stage: PipelineStageFlags::TESSELLATION_CONTROL_SHADER,
+                flags: AccessFlags::SHADER_WRITE,
+            },
+            MemoryAccess::TessellationControlShaderReadWrite => Access {
+                stage: PipelineStageFlags::TESSELLATION_CONTROL_SHADER,
+                flags: AccessFlags::SHADER_READ | AccessFlags::SHADER_WRITE,
+            },
+            MemoryAccess::TessellationControlShaderReadWriteConcurrent => Access {
+                stage: PipelineStageFlags::TESSELLATION_CONTROL_SHADER,
+                flags: AccessFlags::SHADER_READ | AccessFlags::SHADER_WRITE,
+            },
+            MemoryAccess::TessellationEvaluationShaderRead => Access {
+                stage: PipelineStageFlags::TESSELLATION_EVALUATION_SHADER,
+                flags: AccessFlags::SHADER_READ,
+            },
+            MemoryAccess::TessellationEvaluationShaderWrite => Access {
+                stage: PipelineStageFlags::TESSELLATION_EVALUATION_SHADER,
+                flags: AccessFlags::SHADER_WRITE,
+            },
+            MemoryAccess::TessellationEvaluationShaderReadWrite => Access {
+                stage: PipelineStageFlags::TESSELLATION_EVALUATION_SHADER,
+                flags: AccessFlags::SHADER_READ | AccessFlags::SHADER_WRITE,
+            },
+            MemoryAccess::TessellationEvaluationShaderReadWriteConcurrent => Access {
+                stage: PipelineStageFlags::TESSELLATION_EVALUATION_SHADER,
+                flags: AccessFlags::SHADER_READ | AccessFlags::SHADER_WRITE,
+            },
+            MemoryAccess::GeometryShaderRead => Access {
+                stage: PipelineStageFlags::GEOMETRY_SHADER,
+                flags: AccessFlags::SHADER_READ,
+            },
+            MemoryAccess::GeometryShaderWrite => Access {
+                stage: PipelineStageFlags::GEOMETRY_SHADER,
+                flags: AccessFlags::SHADER_WRITE,
+            },
+            MemoryAccess::GeometryShaderReadWrite => Access {
+                stage: PipelineStageFlags::GEOMETRY_SHADER,
+                flags: AccessFlags::SHADER_READ | AccessFlags::SHADER_WRITE,
+            },
+            MemoryAccess::GeometryShaderReadWriteConcurrent => Access {
+                stage: PipelineStageFlags::GEOMETRY_SHADER,
+                flags: AccessFlags::SHADER_READ | AccessFlags::SHADER_WRITE,
+            },
+            MemoryAccess::FragmentShaderRead => Access {
+                stage: PipelineStageFlags::FRAGMENT_SHADER,
+                flags: AccessFlags::SHADER_READ,
+            },
+            MemoryAccess::FragmentShaderWrite => Access {
+                stage: PipelineStageFlags::FRAGMENT_SHADER,
+                flags: AccessFlags::SHADER_WRITE,
+            },
+            MemoryAccess::FragmentShaderReadWrite => Access {
+                stage: PipelineStageFlags::FRAGMENT_SHADER,
+                flags: AccessFlags::SHADER_READ | AccessFlags::SHADER_WRITE,
+            },
+            MemoryAccess::FragmentShaderReadWriteConcurrent => Access {
+                stage: PipelineStageFlags::FRAGMENT_SHADER,
+                flags: AccessFlags::SHADER_READ | AccessFlags::SHADER_WRITE,
+            },
+            MemoryAccess::IndexRead => Access {
+                stage: PipelineStageFlags::INDEX_INPUT,
+                flags: AccessFlags::INDEX_READ,
+            },
+            MemoryAccess::DrawIndirectInfoRead => Access {
+                stage: PipelineStageFlags::DRAW_INDIRECT,
+                flags: AccessFlags::INDIRECT_COMMAND_READ,
+            },
+            MemoryAccess::TransferRead => Access {
+                stage: PipelineStageFlags::TRANSFER,
+                flags: AccessFlags::TRANSFER_READ,
+            },
+            MemoryAccess::TransferWrite => Access {
+                stage: PipelineStageFlags::TRANSFER,
+                flags: AccessFlags::TRANSFER_WRITE,
+            },
+            MemoryAccess::HostTransferRead => Access {
+                stage: PipelineStageFlags::HOST,
+                flags: AccessFlags::HOST_READ,
+            },
+            MemoryAccess::HostTransferWrite => Access {
+                stage: PipelineStageFlags::HOST,
+                flags: AccessFlags::HOST_WRITE,
+            },
+            MemoryAccess::AccelerationStructureBuildRead => Access {
+                stage: PipelineStageFlags::ACCELERATION_STRUCTURE_BUILD_KHR,
+                flags: AccessFlags::ACCELERATION_STRUCTURE_READ_KHR,
+            },
+            MemoryAccess::AccelerationStructureBuildWrite => Access {
+                stage: PipelineStageFlags::ACCELERATION_STRUCTURE_BUILD_KHR,
+                flags: AccessFlags::ACCELERATION_STRUCTURE_WRITE_KHR,
+            },
+            MemoryAccess::AccelerationStructureBuildReadWrite => Access {
+                stage: PipelineStageFlags::ACCELERATION_STRUCTURE_BUILD_KHR,
+                flags: AccessFlags::ACCELERATION_STRUCTURE_READ_KHR | AccessFlags::ACCELERATION_STRUCTURE_WRITE_KHR,
+            },
+        }
+    }
+}
+
+
+impl MemoryAccess {
+    pub fn read(&self) -> bool {
+        match self {
+            MemoryAccess::None => false,
+            MemoryAccess::Read => true,
+            MemoryAccess::Write => false,
+            MemoryAccess::ReadWrite => true,
+            MemoryAccess::GraphicsShaderRead => true,
+            MemoryAccess::GraphicsShaderWrite => false,
+            MemoryAccess::GraphicsShaderReadWrite => true,
+            MemoryAccess::GraphicsShaderReadWriteConcurrent => true,
+            MemoryAccess::ComputeShaderRead => true,
+            MemoryAccess::ComputeShaderWrite => false,
+            MemoryAccess::ComputeShaderReadWrite => true,
+            MemoryAccess::ComputeShaderReadWriteConcurrent => true,
+            MemoryAccess::RayTracingShaderRead => true,
+            MemoryAccess::RayTracingShaderWrite => false,
+            MemoryAccess::RayTracingShaderReadWrite => true,
+            MemoryAccess::RayTracingShaderReadWriteConcurrent => true,
+            MemoryAccess::TaskShaderRead => true,
+            MemoryAccess::TaskShaderWrite => false,
+            MemoryAccess::TaskShaderReadWrite => true,
+            MemoryAccess::TaskShaderReadWriteConcurrent => true,
+            MemoryAccess::MeshShaderRead => true,
+            MemoryAccess::MeshShaderWrite => false,
+            MemoryAccess::MeshShaderReadWrite => true,
+            MemoryAccess::MeshShaderReadWriteConcurrent => true,
+            MemoryAccess::VertexShaderRead => true,
+            MemoryAccess::VertexShaderWrite => false,
+            MemoryAccess::VertexShaderReadWrite => true,
+            MemoryAccess::VertexShaderReadWriteConcurrent => true,
+            MemoryAccess::TessellationControlShaderRead => true,
+            MemoryAccess::TessellationControlShaderWrite => false,
+            MemoryAccess::TessellationControlShaderReadWrite => true,
+            MemoryAccess::TessellationControlShaderReadWriteConcurrent => true,
+            MemoryAccess::TessellationEvaluationShaderRead => true,
+            MemoryAccess::TessellationEvaluationShaderWrite => false,
+            MemoryAccess::TessellationEvaluationShaderReadWrite => true,
+            MemoryAccess::TessellationEvaluationShaderReadWriteConcurrent => true,
+            MemoryAccess::GeometryShaderRead => true,
+            MemoryAccess::GeometryShaderWrite => false,
+            MemoryAccess::GeometryShaderReadWrite => true,
+            MemoryAccess::GeometryShaderReadWriteConcurrent => true,
+            MemoryAccess::FragmentShaderRead => true,
+            MemoryAccess::FragmentShaderWrite => false,
+            MemoryAccess::FragmentShaderReadWrite => true,
+            MemoryAccess::FragmentShaderReadWriteConcurrent => true,
+            MemoryAccess::IndexRead => true,
+            MemoryAccess::DrawIndirectInfoRead => true,
+            MemoryAccess::TransferRead => true,
+            MemoryAccess::TransferWrite => false,
+            MemoryAccess::HostTransferRead => true,
+            MemoryAccess::HostTransferWrite => false,
+            MemoryAccess::AccelerationStructureBuildRead => true,
+            MemoryAccess::AccelerationStructureBuildWrite => false,
+            MemoryAccess::AccelerationStructureBuildReadWrite => true,
+        }
+    }
+
+    pub fn write(&self) -> bool {
+        match self {
+            MemoryAccess::None => false,
+            MemoryAccess::Read => false,
+            MemoryAccess::Write => true,
+            MemoryAccess::ReadWrite => true,
+            MemoryAccess::GraphicsShaderRead => false,
+            MemoryAccess::GraphicsShaderWrite => true,
+            MemoryAccess::GraphicsShaderReadWrite => true,
+            MemoryAccess::GraphicsShaderReadWriteConcurrent => true,
+            MemoryAccess::ComputeShaderRead => false,
+            MemoryAccess::ComputeShaderWrite => true,
+            MemoryAccess::ComputeShaderReadWrite => true,
+            MemoryAccess::ComputeShaderReadWriteConcurrent => true,
+            MemoryAccess::RayTracingShaderRead => false,
+            MemoryAccess::RayTracingShaderWrite => true,
+            MemoryAccess::RayTracingShaderReadWrite => true,
+            MemoryAccess::RayTracingShaderReadWriteConcurrent => true,
+            MemoryAccess::TaskShaderRead => false,
+            MemoryAccess::TaskShaderWrite => true,
+            MemoryAccess::TaskShaderReadWrite => true,
+            MemoryAccess::TaskShaderReadWriteConcurrent => true,
+            MemoryAccess::MeshShaderRead => false,
+            MemoryAccess::MeshShaderWrite => true,
+            MemoryAccess::MeshShaderReadWrite => true,
+            MemoryAccess::MeshShaderReadWriteConcurrent => true,
+            MemoryAccess::VertexShaderRead => false,
+            MemoryAccess::VertexShaderWrite => true,
+            MemoryAccess::VertexShaderReadWrite => true,
+            MemoryAccess::VertexShaderReadWriteConcurrent => true,
+            MemoryAccess::TessellationControlShaderRead => false,
+            MemoryAccess::TessellationControlShaderWrite => true,
+            MemoryAccess::TessellationControlShaderReadWrite => true,
+            MemoryAccess::TessellationControlShaderReadWriteConcurrent => true,
+            MemoryAccess::TessellationEvaluationShaderRead => false,
+            MemoryAccess::TessellationEvaluationShaderWrite => true,
+            MemoryAccess::TessellationEvaluationShaderReadWrite => true,
+            MemoryAccess::TessellationEvaluationShaderReadWriteConcurrent => true,
+            MemoryAccess::GeometryShaderRead => false,
+            MemoryAccess::GeometryShaderWrite => true,
+            MemoryAccess::GeometryShaderReadWrite => true,
+            MemoryAccess::GeometryShaderReadWriteConcurrent => true,
+            MemoryAccess::FragmentShaderRead => false,
+            MemoryAccess::FragmentShaderWrite => true,
+            MemoryAccess::FragmentShaderReadWrite => true,
+            MemoryAccess::FragmentShaderReadWriteConcurrent => true,
+            MemoryAccess::IndexRead => false,
+            MemoryAccess::DrawIndirectInfoRead => false,
+            MemoryAccess::TransferRead => false,
+            MemoryAccess::TransferWrite => true,
+            MemoryAccess::HostTransferRead => false,
+            MemoryAccess::HostTransferWrite => true,
+            MemoryAccess::AccelerationStructureBuildRead => false,
+            MemoryAccess::AccelerationStructureBuildWrite => true,
+            MemoryAccess::AccelerationStructureBuildReadWrite => true,
+        }
+    }
+
+    pub(crate) fn conflicts_with(&self, next: &MemoryAccess) -> bool {
+        match (self.write(), next.write(), next.read()) {
+            (true, true, _) | (true, _, true) => true,
+            _ => false,
+        }
+    }
+}
+
+enum Concurrency {
+    Concurrent,
+    Exclusive,
+}
+
+impl From<MemoryAccess> for (Access, Concurrency) {
+    fn from(access: MemoryAccess) -> Self {
+        match access {
+            MemoryAccess::None => (
+                Access {
+                    stage: PipelineStageFlags::NONE,
+                    flags: AccessFlags::empty(),
+                },
+                Concurrency::Exclusive,
+            ),
+            MemoryAccess::Read => (
+                Access {
+                    stage: PipelineStageFlags::ALL_COMMANDS,
+                    flags: AccessFlags::SHADER_READ,
+                },
+                Concurrency::Exclusive,
+            ),
+            MemoryAccess::Write => (
+                Access {
+                    stage: PipelineStageFlags::ALL_COMMANDS,
+                    flags: AccessFlags::SHADER_WRITE,
+                },
+                Concurrency::Exclusive,
+            ),
+            MemoryAccess::ReadWrite => (
+                Access {
+                    stage: PipelineStageFlags::ALL_COMMANDS,
+                    flags: AccessFlags::SHADER_READ | AccessFlags::SHADER_WRITE,
+                },
+                Concurrency::Exclusive,
+            ),
+            MemoryAccess::GraphicsShaderRead => (
+                Access {
+                    stage: PipelineStageFlags::ALL_GRAPHICS,
+                    flags: AccessFlags::SHADER_READ,
+                },
+                Concurrency::Concurrent,
+            ),
+            MemoryAccess::GraphicsShaderWrite => (
+                Access {
+                    stage: PipelineStageFlags::ALL_GRAPHICS,
+                    flags: AccessFlags::SHADER_WRITE,
+                },
+                Concurrency::Exclusive,
+            ),
+            MemoryAccess::GraphicsShaderReadWrite => (
+                Access {
+                    stage: PipelineStageFlags::ALL_GRAPHICS,
+                    flags: AccessFlags::SHADER_READ | AccessFlags::SHADER_WRITE,
+                },
+                Concurrency::Exclusive,
+            ),
+            MemoryAccess::GraphicsShaderReadWriteConcurrent => (
+                Access {
+                    stage: PipelineStageFlags::ALL_GRAPHICS,
+                    flags: AccessFlags::SHADER_READ | AccessFlags::SHADER_WRITE,
+                },
+                Concurrency::Concurrent,
+            ),
+            MemoryAccess::ComputeShaderRead => (
+                Access {
+                    stage: PipelineStageFlags::COMPUTE_SHADER,
+                    flags: AccessFlags::SHADER_READ,
+                },
+                Concurrency::Concurrent,
+            ),
+            MemoryAccess::ComputeShaderWrite => (
+                Access {
+                    stage: PipelineStageFlags::COMPUTE_SHADER,
+                    flags: AccessFlags::SHADER_WRITE,
+                },
+                Concurrency::Exclusive,
+            ),
+            MemoryAccess::ComputeShaderReadWrite => (
+                Access {
+                    stage: PipelineStageFlags::COMPUTE_SHADER,
+                    flags: AccessFlags::SHADER_READ | AccessFlags::SHADER_WRITE,
+                },
+                Concurrency::Exclusive,
+            ),
+            MemoryAccess::ComputeShaderReadWriteConcurrent => (
+                Access {
+                    stage: PipelineStageFlags::COMPUTE_SHADER,
+                    flags: AccessFlags::SHADER_READ | AccessFlags::SHADER_WRITE,
+                },
+                Concurrency::Concurrent,
+            ),
+            MemoryAccess::RayTracingShaderRead => (
+                Access {
+                    stage: PipelineStageFlags::RAY_TRACING_SHADER_KHR,
+                    flags: AccessFlags::SHADER_READ,
+                },
+                Concurrency::Concurrent,
+            ),
+            MemoryAccess::RayTracingShaderWrite => (
+                Access {
+                    stage: PipelineStageFlags::RAY_TRACING_SHADER_KHR,
+                    flags: AccessFlags::SHADER_WRITE,
+                },
+                Concurrency::Exclusive,
+            ),
+            MemoryAccess::RayTracingShaderReadWrite => (
+                Access {
+                    stage: PipelineStageFlags::RAY_TRACING_SHADER_KHR,
+                    flags: AccessFlags::SHADER_READ | AccessFlags::SHADER_WRITE,
+                },
+                Concurrency::Exclusive,
+            ),
+            MemoryAccess::RayTracingShaderReadWriteConcurrent => (
+                Access {
+                    stage: PipelineStageFlags::RAY_TRACING_SHADER_KHR,
+                    flags: AccessFlags::SHADER_READ | AccessFlags::SHADER_WRITE,
+                },
+                Concurrency::Concurrent,
+            ),
+            MemoryAccess::VertexShaderRead => (
+                Access {
+                    stage: PipelineStageFlags::VERTEX_SHADER,
+                    flags: AccessFlags::SHADER_READ,
+                },
+                Concurrency::Concurrent,
+            ),
+            MemoryAccess::VertexShaderWrite => (
+                Access {
+                    stage: PipelineStageFlags::VERTEX_SHADER,
+                    flags: AccessFlags::SHADER_WRITE,
+                },
+                Concurrency::Exclusive,
+            ),
+            MemoryAccess::VertexShaderReadWrite => (
+                Access {
+                    stage: PipelineStageFlags::VERTEX_SHADER,
+                    flags: AccessFlags::SHADER_READ | AccessFlags::SHADER_WRITE,
+                },
+                Concurrency::Exclusive,
+            ),
+            MemoryAccess::VertexShaderReadWriteConcurrent => (
+                Access {
+                    stage: PipelineStageFlags::VERTEX_SHADER,
+                    flags: AccessFlags::SHADER_READ | AccessFlags::SHADER_WRITE,
+                },
+                Concurrency::Concurrent,
+            ),
+            MemoryAccess::TaskShaderRead => (
+                Access {
+                    stage: PipelineStageFlags::TASK_SHADER_EXT,
+                    flags: AccessFlags::SHADER_READ,
+                },
+                Concurrency::Concurrent,
+            ),
+            MemoryAccess::TaskShaderWrite => (
+                Access {
+                    stage: PipelineStageFlags::TASK_SHADER_EXT,
+                    flags: AccessFlags::SHADER_WRITE,
+                },
+                Concurrency::Exclusive,
+            ),
+            MemoryAccess::TaskShaderReadWrite => (
+                Access {
+                    stage: PipelineStageFlags::TASK_SHADER_EXT,
+                    flags: AccessFlags::SHADER_READ | AccessFlags::SHADER_WRITE,
+                },
+                Concurrency::Exclusive,
+            ),
+            MemoryAccess::TaskShaderReadWriteConcurrent => (
+                Access {
+                    stage: PipelineStageFlags::TASK_SHADER_EXT,
+                    flags: AccessFlags::SHADER_READ | AccessFlags::SHADER_WRITE,
+                },
+                Concurrency::Concurrent,
+            ),
+            MemoryAccess::MeshShaderRead => (
+                Access {
+                    stage: PipelineStageFlags::MESH_SHADER_EXT,
+                    flags: AccessFlags::SHADER_READ,
+                },
+                Concurrency::Concurrent,
+            ),
+            MemoryAccess::MeshShaderWrite => (
+                Access {
+                    stage: PipelineStageFlags::MESH_SHADER_EXT,
+                    flags: AccessFlags::SHADER_WRITE,
+                },
+                Concurrency::Exclusive,
+            ),
+            MemoryAccess::MeshShaderReadWrite => (
+                Access {
+                    stage: PipelineStageFlags::MESH_SHADER_EXT,
+                    flags: AccessFlags::SHADER_READ | AccessFlags::SHADER_WRITE,
+                },
+                Concurrency::Exclusive,
+            ),
+            MemoryAccess::MeshShaderReadWriteConcurrent => (
+                Access {
+                    stage: PipelineStageFlags::MESH_SHADER_EXT,
+                    flags: AccessFlags::SHADER_READ | AccessFlags::SHADER_WRITE,
+                },
+                Concurrency::Concurrent,
+            ),
+            MemoryAccess::TessellationControlShaderRead => (
+                Access {
+                    stage: PipelineStageFlags::TESSELLATION_CONTROL_SHADER,
+                    flags: AccessFlags::SHADER_READ,
+                },
+                Concurrency::Exclusive,
+            ),
+            MemoryAccess::TessellationEvaluationShaderRead => (
+                Access {
+                    stage: PipelineStageFlags::TESSELLATION_EVALUATION_SHADER,
+                    flags: AccessFlags::SHADER_READ,
+                },
+                Concurrency::Exclusive,
+            ),
+            MemoryAccess::GeometryShaderRead => (
+                Access {
+                    stage: PipelineStageFlags::GEOMETRY_SHADER,
+                    flags: AccessFlags::SHADER_READ,
+                },
+                Concurrency::Concurrent,
+            ),
+            MemoryAccess::FragmentShaderRead => (
+                Access {
+                    stage: PipelineStageFlags::FRAGMENT_SHADER,
+                    flags: AccessFlags::SHADER_READ,
+                },
+                Concurrency::Concurrent,
+            ),
+            MemoryAccess::TessellationControlShaderWrite => (
+                Access {
+                    stage: PipelineStageFlags::TESSELLATION_CONTROL_SHADER,
+                    flags: AccessFlags::SHADER_WRITE,
+                },
+                Concurrency::Exclusive,
+            ),
+            MemoryAccess::TessellationEvaluationShaderWrite => (
+                Access {
+                    stage: PipelineStageFlags::TESSELLATION_EVALUATION_SHADER,
+                    flags: AccessFlags::SHADER_WRITE,
+                },
+                Concurrency::Exclusive,
+            ),
+            MemoryAccess::GeometryShaderWrite => (
+                Access {
+                    stage: PipelineStageFlags::GEOMETRY_SHADER,
+                    flags: AccessFlags::SHADER_WRITE,
+                },
+                Concurrency::Exclusive,
+            ),
+            MemoryAccess::FragmentShaderWrite => (
+                Access {
+                    stage: PipelineStageFlags::FRAGMENT_SHADER,
+                    flags: AccessFlags::SHADER_WRITE,
+                },
+                Concurrency::Exclusive,
+            ),
+            MemoryAccess::TessellationControlShaderReadWrite => (
+                Access {
+                    stage: PipelineStageFlags::TESSELLATION_CONTROL_SHADER,
+                    flags: AccessFlags::SHADER_READ | AccessFlags::SHADER_WRITE,
+                },
+                Concurrency::Exclusive,
+            ),
+            MemoryAccess::TessellationControlShaderReadWriteConcurrent => (
+                Access {
+                    stage: PipelineStageFlags::TESSELLATION_CONTROL_SHADER,
+                    flags: AccessFlags::SHADER_READ | AccessFlags::SHADER_WRITE,
+                },
+                Concurrency::Concurrent,
+            ),
+            MemoryAccess::TessellationEvaluationShaderReadWrite => (
+                Access {
+                    stage: PipelineStageFlags::TESSELLATION_EVALUATION_SHADER,
+                    flags: AccessFlags::SHADER_READ | AccessFlags::SHADER_WRITE,
+                },
+                Concurrency::Exclusive,
+            ),
+            MemoryAccess::TessellationEvaluationShaderReadWriteConcurrent => (
+                Access {
+                    stage: PipelineStageFlags::TESSELLATION_EVALUATION_SHADER,
+                    flags: AccessFlags::SHADER_READ | AccessFlags::SHADER_WRITE,
+                },
+                Concurrency::Concurrent,
+            ),
+            MemoryAccess::GeometryShaderReadWrite => (
+                Access {
+                    stage: PipelineStageFlags::GEOMETRY_SHADER,
+                    flags: AccessFlags::SHADER_READ | AccessFlags::SHADER_WRITE,
+                },
+                Concurrency::Exclusive,
+            ),
+            MemoryAccess::GeometryShaderReadWriteConcurrent => (
+                Access {
+                    stage: PipelineStageFlags::GEOMETRY_SHADER,
+                    flags: AccessFlags::SHADER_READ | AccessFlags::SHADER_WRITE,
+                },
+                Concurrency::Concurrent,
+            ),
+            MemoryAccess::FragmentShaderReadWrite => (
+                Access {
+                    stage: PipelineStageFlags::FRAGMENT_SHADER,
+                    flags: AccessFlags::SHADER_READ | AccessFlags::SHADER_WRITE,
+                },
+                Concurrency::Exclusive,
+            ),
+            MemoryAccess::FragmentShaderReadWriteConcurrent => (
+                Access {
+                    stage: PipelineStageFlags::FRAGMENT_SHADER,
+                    flags: AccessFlags::SHADER_READ | AccessFlags::SHADER_WRITE,
+                },
+                Concurrency::Concurrent,
+            ),
+            MemoryAccess::TransferRead => (
+                Access {
+                    stage: PipelineStageFlags::TRANSFER,
+                    flags: AccessFlags::TRANSFER_READ,
+                },
+                Concurrency::Concurrent,
+            ),
+            MemoryAccess::TransferWrite => (
+                Access {
+                    stage: PipelineStageFlags::TRANSFER,
+                    flags: AccessFlags::TRANSFER_WRITE,
+                },
+                Concurrency::Exclusive,
+            ),
+            MemoryAccess::HostTransferRead => (
+                Access {
+                    stage: PipelineStageFlags::HOST,
+                    flags: AccessFlags::HOST_READ,
+                },
+                Concurrency::Concurrent,
+            ),
+            MemoryAccess::HostTransferWrite => (
+                Access {
+                    stage: PipelineStageFlags::HOST,
+                    flags: AccessFlags::HOST_WRITE,
+                },
+                Concurrency::Exclusive,
+            ),
+            MemoryAccess::IndexRead => (
+                Access {
+                    stage: PipelineStageFlags::INDEX_INPUT,
+                    flags: AccessFlags::INDEX_READ,
+                },
+                Concurrency::Concurrent,
+            ),
+            MemoryAccess::DrawIndirectInfoRead => (
+                Access {
+                    stage: PipelineStageFlags::DRAW_INDIRECT,
+                    flags: AccessFlags::INDIRECT_COMMAND_READ,
+                },
+                Concurrency::Concurrent,
+            ),
+            MemoryAccess::AccelerationStructureBuildRead => (
+                Access {
+                    stage: PipelineStageFlags::ACCELERATION_STRUCTURE_BUILD_KHR,
+                    flags: AccessFlags::ACCELERATION_STRUCTURE_READ_KHR,
+                },
+                Concurrency::Concurrent,
+            ),
+            MemoryAccess::AccelerationStructureBuildWrite => (
+                Access {
+                    stage: PipelineStageFlags::ACCELERATION_STRUCTURE_BUILD_KHR,
+                    flags: AccessFlags::ACCELERATION_STRUCTURE_WRITE_KHR,
+                },
+                Concurrency::Exclusive,
+            ),
+            MemoryAccess::AccelerationStructureBuildReadWrite => (
+                Access {
+                    stage: PipelineStageFlags::ACCELERATION_STRUCTURE_BUILD_KHR,
+                    flags: AccessFlags::ACCELERATION_STRUCTURE_READ_KHR
+                        | AccessFlags::ACCELERATION_STRUCTURE_WRITE_KHR,
+                },
+                Concurrency::Exclusive,
+            ),
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ImageAccess {
+    None,
+    GraphicsShaderSampled,
+    GraphicsShaderStorageWriteOnly,
+    GraphicsShaderStorageReadOnly,
+    GraphicsShaderStorageReadWrite,
+    GraphicsShaderStorageReadWriteConcurrent,
+    ComputeShaderSampled,
+    ComputeShaderStorageWriteOnly,
+    ComputeShaderStorageReadOnly,
+    ComputeShaderStorageReadWrite,
+    ComputeShaderStorageReadWriteConcurrent,
+    RayTracingShaderSampled,
+    RayTracingShaderStorageWriteOnly,
+    RayTracingShaderStorageReadOnly,
+    RayTracingShaderStorageReadWrite,
+    RayTracingShaderStorageReadWriteConcurrent,
+    TaskShaderSampled,
+    TaskShaderStorageWriteOnly,
+    TaskShaderStorageReadOnly,
+    TaskShaderStorageReadWrite,
+    TaskShaderStorageReadWriteConcurrent,
+    MeshShaderSampled,
+    MeshShaderStorageWriteOnly,
+    MeshShaderStorageReadOnly,
+    MeshShaderStorageReadWrite,
+    MeshShaderStorageReadWriteConcurrent,
+    VertexShaderSampled,
+    VertexShaderStorageWriteOnly,
+    VertexShaderStorageReadOnly,
+    VertexShaderStorageReadWrite,
+    VertexShaderStorageReadWriteConcurrent,
+    TessellationControlShaderSampled,
+    TessellationControlShaderStorageWriteOnly,
+    TessellationControlShaderStorageReadOnly,
+    TessellationControlShaderStorageReadWrite,
+    TessellationControlShaderStorageReadWriteConcurrent,
+    TessellationEvaluationShaderSampled,
+    TessellationEvaluationShaderStorageWriteOnly,
+    TessellationEvaluationShaderStorageReadOnly,
+    TessellationEvaluationShaderStorageReadWrite,
+    TessellationEvaluationShaderStorageReadWriteConcurrent,
+    GeometryShaderSampled,
+    GeometryShaderStorageWriteOnly,
+    GeometryShaderStorageReadOnly,
+    GeometryShaderStorageReadWrite,
+    GeometryShaderStorageReadWriteConcurrent,
+    FragmentShaderSampled,
+    FragmentShaderStorageWriteOnly,
+    FragmentShaderStorageReadOnly,
+    FragmentShaderStorageReadWrite,
+    FragmentShaderStorageReadWriteConcurrent,
+    TransferRead,
+    TransferWrite,
+    ColorAttachment,
+    DepthAttachment,
+    StencilAttachment,
+    DepthStencilAttachment,
+    DepthAttachmentRead,
+    StencilAttachmentRead,
+    DepthStencilAttachmentRead,
+    ResolveWrite,
+    Present,
+}
+
+impl From<ImageAccess> for Access {
+    fn from(image_access: ImageAccess) -> Self {
+        match image_access {
+            ImageAccess::None => Access {
+                stage: PipelineStageFlags::NONE,
+                flags: AccessFlags::NONE,
+            },
+            ImageAccess::GraphicsShaderSampled => Access {
+                stage: PipelineStageFlags::ALL_GRAPHICS,
+                flags: AccessFlags::SHADER_READ,
+            },
+            ImageAccess::GraphicsShaderStorageWriteOnly => Access {
+                stage: PipelineStageFlags::ALL_GRAPHICS,
+                flags: AccessFlags::SHADER_WRITE,
+            },
+            ImageAccess::GraphicsShaderStorageReadOnly => Access {
+                stage: PipelineStageFlags::ALL_GRAPHICS,
+                flags: AccessFlags::SHADER_READ,
+            },
+            ImageAccess::GraphicsShaderStorageReadWrite => Access {
+                stage: PipelineStageFlags::ALL_GRAPHICS,
+                flags: AccessFlags::SHADER_READ | AccessFlags::SHADER_WRITE,
+            },
+            ImageAccess::GraphicsShaderStorageReadWriteConcurrent => Access {
+                stage: PipelineStageFlags::ALL_GRAPHICS,
+                flags: AccessFlags::SHADER_READ | AccessFlags::SHADER_WRITE,
+            },
+            ImageAccess::ComputeShaderSampled => Access {
+                stage: PipelineStageFlags::COMPUTE_SHADER,
+                flags: AccessFlags::SHADER_READ,
+            },
+            ImageAccess::ComputeShaderStorageWriteOnly => Access {
+                stage: PipelineStageFlags::COMPUTE_SHADER,
+                flags: AccessFlags::SHADER_WRITE,
+            },
+            ImageAccess::ComputeShaderStorageReadOnly => Access {
+                stage: PipelineStageFlags::COMPUTE_SHADER,
+                flags: AccessFlags::SHADER_READ,
+            },
+            ImageAccess::ComputeShaderStorageReadWrite => Access {
+                stage: PipelineStageFlags::COMPUTE_SHADER,
+                flags: AccessFlags::SHADER_READ | AccessFlags::SHADER_WRITE,
+            },
+            ImageAccess::ComputeShaderStorageReadWriteConcurrent => Access {
+                stage: PipelineStageFlags::COMPUTE_SHADER,
+                flags: AccessFlags::SHADER_READ | AccessFlags::SHADER_WRITE,
+            },
+            ImageAccess::RayTracingShaderSampled => Access {
+                stage: PipelineStageFlags::RAY_TRACING_SHADER_KHR,
+                flags: AccessFlags::SHADER_READ,
+            },
+            ImageAccess::RayTracingShaderStorageWriteOnly => Access {
+                stage: PipelineStageFlags::RAY_TRACING_SHADER_KHR,
+                flags: AccessFlags::SHADER_WRITE,
+            },
+            ImageAccess::RayTracingShaderStorageReadOnly => Access {
+                stage: PipelineStageFlags::RAY_TRACING_SHADER_KHR,
+                flags: AccessFlags::SHADER_READ,
+            },
+            ImageAccess::RayTracingShaderStorageReadWrite => Access {
+                stage: PipelineStageFlags::RAY_TRACING_SHADER_KHR,
+                flags: AccessFlags::SHADER_READ | AccessFlags::SHADER_WRITE,
+            },
+            ImageAccess::RayTracingShaderStorageReadWriteConcurrent => Access {
+                stage: PipelineStageFlags::RAY_TRACING_SHADER_KHR,
+                flags: AccessFlags::SHADER_READ | AccessFlags::SHADER_WRITE,
+            },
+            ImageAccess::TaskShaderSampled => Access {
+                stage: PipelineStageFlags::TASK_SHADER_NV,
+                flags: AccessFlags::SHADER_READ,
+            },
+            ImageAccess::TaskShaderStorageWriteOnly => Access {
+                stage: PipelineStageFlags::TASK_SHADER_NV,
+                flags: AccessFlags::SHADER_WRITE,
+            },
+            ImageAccess::TaskShaderStorageReadOnly => Access {
+                stage: PipelineStageFlags::TASK_SHADER_NV,
+                flags: AccessFlags::SHADER_READ,
+            },
+            ImageAccess::TaskShaderStorageReadWrite => Access {
+                stage: PipelineStageFlags::TASK_SHADER_NV,
+                flags: AccessFlags::SHADER_READ | AccessFlags::SHADER_WRITE,
+            },
+            ImageAccess::TaskShaderStorageReadWriteConcurrent => Access {
+                stage: PipelineStageFlags::TASK_SHADER_NV,
+                flags: AccessFlags::SHADER_READ | AccessFlags::SHADER_WRITE,
+            },
+            ImageAccess::MeshShaderSampled => Access {
+                stage: PipelineStageFlags::MESH_SHADER_NV,
+                flags: AccessFlags::SHADER_READ,
+            },
+            ImageAccess::MeshShaderStorageWriteOnly => Access {
+                stage: PipelineStageFlags::MESH_SHADER_NV,
+                flags: AccessFlags::SHADER_WRITE,
+            },
+            ImageAccess::MeshShaderStorageReadOnly => Access {
+                stage: PipelineStageFlags::MESH_SHADER_NV,
+                flags: AccessFlags::SHADER_READ,
+            },
+            ImageAccess::MeshShaderStorageReadWrite => Access {
+                stage: PipelineStageFlags::MESH_SHADER_NV,
+                flags: AccessFlags::SHADER_READ | AccessFlags::SHADER_WRITE,
+            },
+            ImageAccess::MeshShaderStorageReadWriteConcurrent => Access {
+                stage: PipelineStageFlags::MESH_SHADER_NV,
+                flags: AccessFlags::SHADER_READ | AccessFlags::SHADER_WRITE,
+            },
+            ImageAccess::VertexShaderSampled => Access {
+                stage: PipelineStageFlags::VERTEX_SHADER,
+                flags: AccessFlags::SHADER_READ,
+            },
+            ImageAccess::VertexShaderStorageWriteOnly => Access {
+                stage: PipelineStageFlags::VERTEX_SHADER,
+                flags: AccessFlags::SHADER_WRITE,
+            },
+            ImageAccess::VertexShaderStorageReadOnly => Access {
+                stage: PipelineStageFlags::VERTEX_SHADER,
+                flags: AccessFlags::SHADER_READ,
+            },
+            ImageAccess::VertexShaderStorageReadWrite => Access {
+                stage: PipelineStageFlags::VERTEX_SHADER,
+                flags: AccessFlags::SHADER_READ | AccessFlags::SHADER_WRITE,
+            },
+            ImageAccess::VertexShaderStorageReadWriteConcurrent => Access {
+                stage: PipelineStageFlags::VERTEX_SHADER,
+                flags: AccessFlags::SHADER_READ | AccessFlags::SHADER_WRITE,
+            },
+            ImageAccess::TessellationControlShaderSampled => Access {
+                stage: PipelineStageFlags::TESSELLATION_CONTROL_SHADER,
+                flags: AccessFlags::SHADER_READ,
+            },
+            ImageAccess::TessellationControlShaderStorageWriteOnly => Access {
+                stage: PipelineStageFlags::TESSELLATION_CONTROL_SHADER,
+                flags: AccessFlags::SHADER_WRITE,
+            },
+            ImageAccess::TessellationControlShaderStorageReadOnly => Access {
+                stage: PipelineStageFlags::TESSELLATION_CONTROL_SHADER,
+                flags: AccessFlags::SHADER_READ,
+            },
+            ImageAccess::TessellationControlShaderStorageReadWrite => Access {
+                stage: PipelineStageFlags::TESSELLATION_CONTROL_SHADER,
+                flags: AccessFlags::SHADER_READ | AccessFlags::SHADER_WRITE,
+            },
+            ImageAccess::TessellationControlShaderStorageReadWriteConcurrent => Access {
+                stage: PipelineStageFlags::TESSELLATION_CONTROL_SHADER,
+                flags: AccessFlags::SHADER_READ | AccessFlags::SHADER_WRITE,
+            },
+            ImageAccess::TessellationEvaluationShaderSampled => Access {
+                stage: PipelineStageFlags::TESSELLATION_EVALUATION_SHADER,
+                flags: AccessFlags::SHADER_READ,
+            },
+            ImageAccess::TessellationEvaluationShaderStorageWriteOnly => Access {
+                stage: PipelineStageFlags::TESSELLATION_EVALUATION_SHADER,
+                flags: AccessFlags::SHADER_WRITE,
+            },
+            ImageAccess::TessellationEvaluationShaderStorageReadOnly => Access {
+                stage: PipelineStageFlags::TESSELLATION_EVALUATION_SHADER,
+                flags: AccessFlags::SHADER_READ,
+            },
+            ImageAccess::TessellationEvaluationShaderStorageReadWrite => Access {
+                stage: PipelineStageFlags::TESSELLATION_EVALUATION_SHADER,
+                flags: AccessFlags::SHADER_READ | AccessFlags::SHADER_WRITE,
+            },
+            ImageAccess::TessellationEvaluationShaderStorageReadWriteConcurrent => Access {
+                stage: PipelineStageFlags::TESSELLATION_EVALUATION_SHADER,
+                flags: AccessFlags::SHADER_READ | AccessFlags::SHADER_WRITE,
+            },
+            ImageAccess::GeometryShaderSampled => Access {
+                stage: PipelineStageFlags::GEOMETRY_SHADER,
+                flags: AccessFlags::SHADER_READ,
+            },
+            ImageAccess::GeometryShaderStorageWriteOnly => Access {
+                stage: PipelineStageFlags::GEOMETRY_SHADER,
+                flags: AccessFlags::SHADER_WRITE,
+            },
+            ImageAccess::GeometryShaderStorageReadOnly => Access {
+                stage: PipelineStageFlags::GEOMETRY_SHADER,
+                flags: AccessFlags::SHADER_READ,
+            },
+            ImageAccess::GeometryShaderStorageReadWrite => Access {
+                stage: PipelineStageFlags::GEOMETRY_SHADER,
+                flags: AccessFlags::SHADER_READ | AccessFlags::SHADER_WRITE,
+            },
+            ImageAccess::GeometryShaderStorageReadWriteConcurrent => Access {
+                stage: PipelineStageFlags::GEOMETRY_SHADER,
+                flags: AccessFlags::SHADER_READ | AccessFlags::SHADER_WRITE,
+            },
+            ImageAccess::FragmentShaderSampled => Access {
+                stage: PipelineStageFlags::FRAGMENT_SHADER,
+                flags: AccessFlags::SHADER_READ,
+            },
+            ImageAccess::FragmentShaderStorageWriteOnly => Access {
+                stage: PipelineStageFlags::FRAGMENT_SHADER,
+                flags: AccessFlags::SHADER_WRITE,
+            },
+            ImageAccess::FragmentShaderStorageReadOnly => Access {
+                stage: PipelineStageFlags::FRAGMENT_SHADER,
+                flags: AccessFlags::SHADER_READ,
+            },
+            ImageAccess::FragmentShaderStorageReadWrite => Access {
+                stage: PipelineStageFlags::FRAGMENT_SHADER,
+                flags: AccessFlags::SHADER_READ | AccessFlags::SHADER_WRITE,
+            },
+            ImageAccess::FragmentShaderStorageReadWriteConcurrent => Access {
+                stage: PipelineStageFlags::FRAGMENT_SHADER,
+                flags: AccessFlags::SHADER_READ | AccessFlags::SHADER_WRITE,
+            },
+            ImageAccess::TransferRead => Access {
+                stage: PipelineStageFlags::TRANSFER,
+                flags: AccessFlags::TRANSFER_READ,
+            },
+            ImageAccess::TransferWrite => Access {
+                stage: PipelineStageFlags::TRANSFER,
+                flags: AccessFlags::TRANSFER_WRITE,
+            },
+            ImageAccess::ColorAttachment => Access {
+                stage: PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                flags: AccessFlags::COLOR_ATTACHMENT_WRITE,
+            },
+            ImageAccess::DepthAttachment => Access {
+                stage: PipelineStageFlags::LATE_FRAGMENT_TESTS,
+                flags: AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
+            },
+            ImageAccess::StencilAttachment => Access {
+                stage: PipelineStageFlags::LATE_FRAGMENT_TESTS,
+                flags: AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
+            },
+            ImageAccess::DepthStencilAttachment => Access {
+                stage: PipelineStageFlags::LATE_FRAGMENT_TESTS,
+                flags: AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
+            },
+            ImageAccess::DepthAttachmentRead => Access {
+                stage: PipelineStageFlags::EARLY_FRAGMENT_TESTS,
+                flags: AccessFlags::DEPTH_STENCIL_ATTACHMENT_READ,
+            },
+            ImageAccess::StencilAttachmentRead => Access {
+                stage: PipelineStageFlags::EARLY_FRAGMENT_TESTS,
+                flags: AccessFlags::DEPTH_STENCIL_ATTACHMENT_READ,
+            },
+            ImageAccess::DepthStencilAttachmentRead => Access {
+                stage: PipelineStageFlags::EARLY_FRAGMENT_TESTS,
+                flags: AccessFlags::DEPTH_STENCIL_ATTACHMENT_READ,
+            },
+            ImageAccess::ResolveWrite => Access {
+                stage: PipelineStageFlags::RESOLVE,
+                flags: AccessFlags::COLOR_ATTACHMENT_WRITE,
+            },
+            ImageAccess::Present => Access {
+                stage: PipelineStageFlags::BOTTOM_OF_PIPE,
+                flags: AccessFlags::MEMORY_READ,
+            },
+        }
+    }
+}
+
+
+impl ImageAccess {
+    pub(crate) fn read(&self) -> bool {
+        match self {
+            ImageAccess::None => false,
+            ImageAccess::GraphicsShaderSampled => true,
+            ImageAccess::GraphicsShaderStorageWriteOnly => false,
+            ImageAccess::GraphicsShaderStorageReadOnly => true,
+            ImageAccess::GraphicsShaderStorageReadWrite => true,
+            ImageAccess::GraphicsShaderStorageReadWriteConcurrent => true,
+            ImageAccess::ComputeShaderSampled => true,
+            ImageAccess::ComputeShaderStorageWriteOnly => false,
+            ImageAccess::ComputeShaderStorageReadOnly => true,
+            ImageAccess::ComputeShaderStorageReadWrite => true,
+            ImageAccess::ComputeShaderStorageReadWriteConcurrent => true,
+            ImageAccess::RayTracingShaderSampled => true,
+            ImageAccess::RayTracingShaderStorageWriteOnly => false,
+            ImageAccess::RayTracingShaderStorageReadOnly => true,
+            ImageAccess::RayTracingShaderStorageReadWrite => true,
+            ImageAccess::RayTracingShaderStorageReadWriteConcurrent => true,
+            ImageAccess::TaskShaderSampled => true,
+            ImageAccess::TaskShaderStorageWriteOnly => false,
+            ImageAccess::TaskShaderStorageReadOnly => true,
+            ImageAccess::TaskShaderStorageReadWrite => true,
+            ImageAccess::TaskShaderStorageReadWriteConcurrent => true,
+            ImageAccess::MeshShaderSampled => true,
+            ImageAccess::MeshShaderStorageWriteOnly => false,
+            ImageAccess::MeshShaderStorageReadOnly => true,
+            ImageAccess::MeshShaderStorageReadWrite => true,
+            ImageAccess::MeshShaderStorageReadWriteConcurrent => true,
+            ImageAccess::VertexShaderSampled => true,
+            ImageAccess::VertexShaderStorageWriteOnly => false,
+            ImageAccess::VertexShaderStorageReadOnly => true,
+            ImageAccess::VertexShaderStorageReadWrite => true,
+            ImageAccess::VertexShaderStorageReadWriteConcurrent => true,
+            ImageAccess::TessellationControlShaderSampled => true,
+            ImageAccess::TessellationControlShaderStorageWriteOnly => false,
+            ImageAccess::TessellationControlShaderStorageReadOnly => true,
+            ImageAccess::TessellationControlShaderStorageReadWrite => true,
+            ImageAccess::TessellationControlShaderStorageReadWriteConcurrent => true,
+            ImageAccess::TessellationEvaluationShaderSampled => true,
+            ImageAccess::TessellationEvaluationShaderStorageWriteOnly => false,
+            ImageAccess::TessellationEvaluationShaderStorageReadOnly => true,
+            ImageAccess::TessellationEvaluationShaderStorageReadWrite => true,
+            ImageAccess::TessellationEvaluationShaderStorageReadWriteConcurrent => true,
+            ImageAccess::GeometryShaderSampled => true,
+            ImageAccess::GeometryShaderStorageWriteOnly => false,
+            ImageAccess::GeometryShaderStorageReadOnly => true,
+            ImageAccess::GeometryShaderStorageReadWrite => true,
+            ImageAccess::GeometryShaderStorageReadWriteConcurrent => true,
+            ImageAccess::FragmentShaderSampled => true,
+            ImageAccess::FragmentShaderStorageWriteOnly => false,
+            ImageAccess::FragmentShaderStorageReadOnly => true,
+            ImageAccess::FragmentShaderStorageReadWrite => true,
+            ImageAccess::FragmentShaderStorageReadWriteConcurrent => true,
+            ImageAccess::TransferRead => true,
+            ImageAccess::TransferWrite => false,
+            ImageAccess::ColorAttachment => false,
+            ImageAccess::DepthAttachment => false,
+            ImageAccess::StencilAttachment => false,
+            ImageAccess::DepthStencilAttachment => false,
+            ImageAccess::DepthAttachmentRead => true,
+            ImageAccess::StencilAttachmentRead => true,
+            ImageAccess::DepthStencilAttachmentRead => true,
+            ImageAccess::ResolveWrite => false,
+            ImageAccess::Present => true,
+        }
+    }
+    fn write(&self) -> bool {
+        match self {
+            ImageAccess::None => false,
+            ImageAccess::GraphicsShaderSampled => false,
+            ImageAccess::GraphicsShaderStorageWriteOnly => true,
+            ImageAccess::GraphicsShaderStorageReadOnly => false,
+            ImageAccess::GraphicsShaderStorageReadWrite => true,
+            ImageAccess::GraphicsShaderStorageReadWriteConcurrent => true,
+            ImageAccess::ComputeShaderSampled => false,
+            ImageAccess::ComputeShaderStorageWriteOnly => true,
+            ImageAccess::ComputeShaderStorageReadOnly => false,
+            ImageAccess::ComputeShaderStorageReadWrite => true,
+            ImageAccess::ComputeShaderStorageReadWriteConcurrent => true,
+            ImageAccess::RayTracingShaderSampled => false,
+            ImageAccess::RayTracingShaderStorageWriteOnly => true,
+            ImageAccess::RayTracingShaderStorageReadOnly => false,
+            ImageAccess::RayTracingShaderStorageReadWrite => true,
+            ImageAccess::RayTracingShaderStorageReadWriteConcurrent => true,
+            ImageAccess::TaskShaderSampled => false,
+            ImageAccess::TaskShaderStorageWriteOnly => true,
+            ImageAccess::TaskShaderStorageReadOnly => false,
+            ImageAccess::TaskShaderStorageReadWrite => true,
+            ImageAccess::TaskShaderStorageReadWriteConcurrent => true,
+            ImageAccess::MeshShaderSampled => false,
+            ImageAccess::MeshShaderStorageWriteOnly => true,
+            ImageAccess::MeshShaderStorageReadOnly => false,
+            ImageAccess::MeshShaderStorageReadWrite => true,
+            ImageAccess::MeshShaderStorageReadWriteConcurrent => true,
+            ImageAccess::VertexShaderSampled => false,
+            ImageAccess::VertexShaderStorageWriteOnly => true,
+            ImageAccess::VertexShaderStorageReadOnly => false,
+            ImageAccess::VertexShaderStorageReadWrite => true,
+            ImageAccess::VertexShaderStorageReadWriteConcurrent => true,
+            ImageAccess::TessellationControlShaderSampled => false,
+            ImageAccess::TessellationControlShaderStorageWriteOnly => true,
+            ImageAccess::TessellationControlShaderStorageReadOnly => false,
+            ImageAccess::TessellationControlShaderStorageReadWrite => true,
+            ImageAccess::TessellationControlShaderStorageReadWriteConcurrent => true,
+            ImageAccess::TessellationEvaluationShaderSampled => false,
+            ImageAccess::TessellationEvaluationShaderStorageWriteOnly => true,
+            ImageAccess::TessellationEvaluationShaderStorageReadOnly => false,
+            ImageAccess::TessellationEvaluationShaderStorageReadWrite => true,
+            ImageAccess::TessellationEvaluationShaderStorageReadWriteConcurrent => true,
+            ImageAccess::GeometryShaderSampled => false,
+            ImageAccess::GeometryShaderStorageWriteOnly => true,
+            ImageAccess::GeometryShaderStorageReadOnly => false,
+            ImageAccess::GeometryShaderStorageReadWrite => true,
+            ImageAccess::GeometryShaderStorageReadWriteConcurrent => true,
+            ImageAccess::FragmentShaderSampled => false,
+            ImageAccess::FragmentShaderStorageWriteOnly => true,
+            ImageAccess::FragmentShaderStorageReadOnly => false,
+            ImageAccess::FragmentShaderStorageReadWrite => true,
+            ImageAccess::FragmentShaderStorageReadWriteConcurrent => true,
+            ImageAccess::TransferRead => false,
+            ImageAccess::TransferWrite => true,
+            ImageAccess::ColorAttachment => true,
+            ImageAccess::DepthAttachment => true,
+            ImageAccess::StencilAttachment => true,
+            ImageAccess::DepthStencilAttachment => true,
+            ImageAccess::DepthAttachmentRead => false,
+            ImageAccess::StencilAttachmentRead => false,
+            ImageAccess::DepthStencilAttachmentRead => false,
+            ImageAccess::ResolveWrite => true,
+            ImageAccess::Present => false,
+        }
+    }
+
+    pub(crate) fn conflicts_with(&self, next: &ImageAccess) -> bool {
+        match (self.write(), next.write(), next.read()) {
+            (true, true, _) | (true, _, true) => true,
+            _ => false,
+        }
+    }
+}
+
+pub trait Task: 'static {
+    fn prepare(&mut self, info: &ExecutionInfo<'_>) {}
+    fn usage(&self) -> Vec<Use<'_>>;
+    fn record(&mut self, ctx: TaskCommandContext<'_>);
+}
+
+
+pub struct Batch {
+    barriers: Vec<PipelineBarrier>,
+    task_ids: Vec<usize>,
+}
+
+type BatchId = usize;
+
+#[derive(Default)]
+pub struct TaskGraph {
+    tasks: Vec<Box<dyn Task>>,
+    permutations: Vec<Permutation>,
+}
+
+impl TaskGraph {
+    pub fn execute(&mut self, info: crate::ExecutionInfo<'_>) -> ExecutableCommandList {
+            let mut usages = Usages::default();
+
+            for task in &mut self.tasks {
+                task.prepare(&info);
+                usages.buffer_ids.extend(filter_buffer_uses(&**task).iter().map(|(x, y)| *x));
+                usages.image_ids.extend(filter_image_uses(&**task).iter().map(|(x, y)| *x));
+            }
+
+        loop {
+            let permutation = self.permutations.iter_mut().find(|perm| perm.usages == usages);
+
+            match permutation {
+                Some(mut perm) => break perm.execute(info, &mut self.tasks),
+                None => {
+                    self.permutations.push(Permutation::default());
+                    dbg!("creating new permutation...");
+                    for (i, task) in self.tasks.iter().enumerate() {
+                        self.permutations.last_mut().unwrap().add_task(&**task, i);
+                    }
+                }
+            }
+        }
+    }
+    pub fn add_task(&mut self, task: impl Task) {
+        for perm in &mut self.permutations {
+            perm.add_task(&task, self.tasks.len())
+        }
+        self.tasks.push(Box::new(task));
+    }
+}
+
+#[derive(Default, PartialEq, Eq)]
+pub struct Usages {
+    buffer_ids: HashSet<BufferId>,
+    image_ids: HashSet<ImageId>,
+}
+#[derive(Default)]
+pub struct Permutation {
+    batches: Vec<Batch>,
+    task_buffers: Vec<TaskBuffer>,
+    buffer_last_use: HashMap<BufferId, (BatchId, MemoryAccess)>,
+    task_images: Vec<TaskImage>,
+    image_last_use: HashMap<ImageId, (BatchId, ImageAccess)>,
+    usages: Usages
+}
+
+pub struct TaskCommandContext<'a> {
+    execution_info: ExecutionInfo<'a>,
+    command_recorder: &'a mut CommandRecorder,
+}
+
+impl TaskCommandContext<'_> {
+    pub fn device(&self) -> &Device {
+        &self.execution_info.device
+    }
+    pub fn swapchain(&self) -> Option<&Swapchain> {
+        self.execution_info.swapchain
+    }
+    pub fn resolution(&self) -> Option<[u32; 2]> {
+        self.execution_info.resolution
+    }
+    pub fn cmd(&mut self) -> &mut CommandRecorder {
+        self.command_recorder
+    }
+}
+
+#[derive(Clone)]
+pub struct ExecutionInfo<'a> {
+    pub device: &'a Device,
+    pub swapchain: Option<&'a Swapchain>,
+    pub resolution: Option<[u32; 2]>,
+}
+
+impl Permutation {
+    pub fn execute(&mut self, info: ExecutionInfo<'_>, tasks: &mut [Box<dyn Task>]) -> ExecutableCommandList {
+        let mut command_recorder = info.device.create_command_recorder(CommandRecorderInfo::default());
+
+        for batch in &mut self.batches {
+            for barrier in &batch.barriers {
+                command_recorder.pipeline_barrier(barrier.clone());
+                dbg!("barrier");
+            }
+            for task_id in &batch.task_ids {
+                tasks[*task_id].record(TaskCommandContext {
+            execution_info: info.clone(),
+            command_recorder: &mut command_recorder,
+        });
+            }
+        }
+
+        command_recorder.complete()
+    }
+    pub fn add_task(&mut self, task: &dyn Task, task_id: usize) {
+        let mut minimum_batch: Option<usize> = None;
+        let buffers = filter_buffer_uses(task);
+        let images = filter_image_uses(task);
+
+        let mut buffer_ids = HashSet::new();
+        let mut image_ids = HashSet::new();
+
+        for (id, _) in &buffers {
+            buffer_ids.insert(*id);
+        }
+
+        for (id, _) in &images {
+            image_ids.insert(*id);
+        }
+
+        let potential_conflict_buffers = self.usages.buffer_ids.intersection(&buffer_ids);
+        let potential_conflict_images = self.usages.image_ids.intersection(&image_ids);
+
+        for id in potential_conflict_buffers {
+            let Some((last_batch_id, from_access)) = self.buffer_last_use.get_mut(&id) else {
+                continue;
+            };
+            let to_access = buffers.get(&id).unwrap();
+
+            if from_access.conflicts_with(&to_access) {
+                match &mut minimum_batch {
+                    Some(min) => *min = *min.max(last_batch_id),
+                    None => minimum_batch = Some(*last_batch_id),
+                }
+            }
+        }
+
+        for id in potential_conflict_images {
+            let Some((last_batch_id, from_access)) = self.image_last_use.get_mut(&id) else {
+                continue;
+            };
+            let to_access = images.get(&id).unwrap();
+
+            if from_access.conflicts_with(&to_access) {
+                match &mut minimum_batch {
+                    Some(min) => *min = *min.max(last_batch_id),
+                    None => minimum_batch = Some(*last_batch_id),
+                }
+            }
+        }
+        let batch = match minimum_batch {
+            Some(batch) => {
+                let batch = batch + 1;
+                if batch == self.batches.len() {
+                    self.batches.push(Batch {
+                        task_ids: vec![task_id],
+                        barriers: vec![],
+                    })
+                } else {
+                    self.batches[batch].task_ids.push(task_id);
+                }
+                batch
+            }
+            None => {
+                match self.batches.len() {
+                    0 => {
+                        self.batches.push(Batch {
+                            task_ids: vec![task_id],
+                            barriers: vec![],
+                        })
+                    },
+                    _ => {
+                        self.batches[0].task_ids.push(task_id);
+                    }
+                }
+                0
+            }
+        };
+
+        for (buffer, access) in buffers {
+            self.usages.buffer_ids.insert(buffer);
+            let Some((prev_batch, prev_access)) = self.buffer_last_use.insert(buffer, (batch, access)) else {
+                continue;
+            };
+            self.batches[batch].barriers.push(PipelineBarrier::Memory {
+                src: prev_access.into(),
+                dst: access.into()
+            });
+        }
+
+        for (image, access) in images {
+            self.usages.image_ids.insert(image);
+            let (prev_batch, prev_access) = match self.image_last_use.insert(image, (batch, access)) {
+                Some(x) => x,
+                None => (0, ImageAccess::None)
+            };
+            self.batches[batch].barriers.push(PipelineBarrier::ImageTransition {
+                src: (prev_access.into(), prev_access.into()),
+                dst: (access.into(), access.into()),
+                image_slice: Default::default(),
+                image_id: image,
+            });
+
+        }
+    }
+}
+fn filter_buffer_uses(task: &dyn Task) -> HashMap<BufferId, MemoryAccess> {
+    task.usage()
+            .iter()
+            .filter(|usage| matches!(usage, Use::Buffer(_, _)))
+            .map(|x| x.buffer())
+            .flat_map(|(x, y)| x.buffer_ids().into_iter().map(move |x| (x, y)))
+            .collect::<HashMap<_, _>>()
+}
+
+fn filter_image_uses(task: &dyn Task) -> HashMap<ImageId, ImageAccess> {
+    task.usage()
+            .iter()
+            .filter(|usage| matches!(usage, Use::Image(_, _)))
+            .map(|x| x.image())
+            .flat_map(|(x, y)| x.image_ids().into_iter().map(move |x| (x, y)))
+            .collect::<HashMap<_, _>>()
 }
