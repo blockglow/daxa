@@ -3,7 +3,11 @@
 use crate::device_selector::best_gpu;
 use crate::surface_format_selector::default_format_score;
 use bitflags::bitflags;
-use daxa_sys::{daxa_BinarySemaphore, daxa_Bool8, daxa_Device, daxa_ExecutableCommandList, daxa_ImageFlags, daxa_ImageUsageFlags, daxa_MemoryFlags, daxa_NativeWindowHandle, daxa_SmallString, daxa_TimelinePair, VkCompareOp, VkExtent3D, VkFormat, VkPipelineStageFlags};
+use daxa_sys::{
+    daxa_BinarySemaphore, daxa_Bool8, daxa_Device, daxa_ExecutableCommandList, daxa_ImageFlags,
+    daxa_ImageUsageFlags, daxa_MemoryFlags, daxa_NativeWindowHandle, daxa_SmallString,
+    daxa_TimelinePair, VkCompareOp, VkExtent3D, VkFormat, VkPipelineStageFlags,
+};
 use derive_more::{Deref, DerefMut, Into};
 use glslang::error::GlslangError::ParseError;
 use glslang::include::{IncludeCallback, IncludeResult, IncludeType};
@@ -14,6 +18,7 @@ use glslang::{
 use lazy_static::lazy_static;
 use raw_window_handle::{HasRawWindowHandle, HasWindowHandle, RawWindowHandle, WindowHandle};
 use std::cell::RefCell;
+use std::cmp::PartialEq;
 use std::collections::{HashMap, HashSet};
 use std::convert::identity;
 use std::ffi::c_char;
@@ -26,8 +31,7 @@ use std::process::Command;
 use std::rc::Rc;
 use std::sync::atomic::AtomicPtr;
 use std::sync::{Arc, Mutex};
-use std::{ffi, fmt, fs, mem, ptr, time};
-use std::cmp::PartialEq;
+use std::{ffi, fmt, fs, iter, mem, ptr, time};
 use uuid::Uuid;
 
 pub type Flags = u64;
@@ -83,6 +87,7 @@ impl<T: AsRef<[u8]>> From<T> for SmallString {
 }
 
 pub struct Instance(daxa_sys::daxa_Instance);
+unsafe impl Send for Instance {}
 
 impl Instance {
     pub fn new(info: InstanceInfo) -> Self {
@@ -128,7 +133,6 @@ impl Instance {
             let mut device = MaybeUninit::uninit();
             let result =
                 daxa_sys::daxa_instance_create_device(*instance, &info, device.as_mut_ptr());
-            dbg!(result);
             device.assume_init()
         };
         Device(device)
@@ -495,6 +499,7 @@ bitflags! {
 
 #[derive(Clone)]
 pub struct Device(daxa_sys::daxa_Device);
+unsafe impl Send for Device {}
 
 pub struct CommandRecorder(daxa_sys::daxa_Device, daxa_sys::daxa_CommandRecorder);
 #[derive(Clone, Copy)]
@@ -640,12 +645,15 @@ impl CommandRecorder {
         }
     }
     pub fn assign_push_constant<T: Copy>(&self, push: &T) {
-        unsafe { 
-            daxa_sys::daxa_cmd_push_constant(self.1, &daxa_sys::daxa_PushConstantInfo {
-                data: push as *const _ as *const _,
-                size: mem::size_of::<T>() as u64,
-                offset: 0,
-            });
+        unsafe {
+            daxa_sys::daxa_cmd_push_constant(
+                self.1,
+                &daxa_sys::daxa_PushConstantInfo {
+                    data: push as *const _ as *const _,
+                    size: mem::size_of::<T>() as u64,
+                    offset: 0,
+                },
+            );
         }
     }
     pub fn defer_destruct_buffer(&self, buffer_id: BufferId) {
@@ -655,13 +663,16 @@ impl CommandRecorder {
     }
     pub fn copy_buffer_to_buffer(&self, buffer_copy: BufferCopy) {
         unsafe {
-            daxa_sys::daxa_cmd_copy_buffer_to_buffer(self.1, &daxa_sys::daxa_BufferCopyInfo {
-                src_buffer: buffer_copy.src.0,
-                dst_buffer: buffer_copy.dst.0,
-                src_offset: buffer_copy.src_offset,
-                dst_offset: buffer_copy.dst_offset,
-                size: buffer_copy.size,
-            });
+            daxa_sys::daxa_cmd_copy_buffer_to_buffer(
+                self.1,
+                &daxa_sys::daxa_BufferCopyInfo {
+                    src_buffer: buffer_copy.src.0,
+                    dst_buffer: buffer_copy.dst.0,
+                    src_offset: buffer_copy.src_offset,
+                    dst_offset: buffer_copy.dst_offset,
+                    size: buffer_copy.size,
+                },
+            );
         }
     }
     pub fn pipeline_barrier(&mut self, barrier: PipelineBarrier) {
@@ -905,7 +916,6 @@ pub struct BinarySemaphoreInfo {
     pub name: SmallString,
 }
 
-
 bitflags! {
     /// Memory flags
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -947,7 +957,7 @@ bitflags! {
 pub struct BufferInfo {
     pub size: usize,
     pub memory_flags: MemoryFlags,
-    pub name: SmallString
+    pub name: SmallString,
 }
 
 pub struct ImageInfo {
@@ -964,23 +974,31 @@ pub struct ImageInfo {
 }
 
 impl Device {
-    pub fn host_access<'a, T>(&'a self, host_access_buffer_id: BufferId) -> &'a mut T {
+    pub fn host_access_ptr<T>(&self, host_access_buffer_id: BufferId) -> *mut T {
         let Self(device) = self;
         unsafe {
             let mut buffer_address = MaybeUninit::uninit();
-            daxa_sys::daxa_dvc_buffer_host_address(*device, host_access_buffer_id.0, buffer_address.as_mut_ptr());
-            buffer_address.assume_init().cast::<T>().as_mut().unwrap()
+            daxa_sys::daxa_dvc_buffer_host_address(
+                *device,
+                host_access_buffer_id.0,
+                buffer_address.as_mut_ptr(),
+            );
+            buffer_address.assume_init().cast::<T>()
         }
     }
     pub fn create_buffer(&self, info: BufferInfo) -> BufferId {
         let Self(device) = self;
         let buffer = unsafe {
             let mut buffer_id = MaybeUninit::uninit();
-            daxa_sys::daxa_dvc_create_buffer(*device, &mut daxa_sys::daxa_BufferInfo {
-                size: info.size,
-                allocate_info: info.memory_flags.bits(),
-                name: info.name.into(),
-            }, buffer_id.as_mut_ptr());
+            daxa_sys::daxa_dvc_create_buffer(
+                *device,
+                &mut daxa_sys::daxa_BufferInfo {
+                    size: info.size,
+                    allocate_info: info.memory_flags.bits(),
+                    name: info.name.into(),
+                },
+                buffer_id.as_mut_ptr(),
+            );
             buffer_id.assume_init()
         };
 
@@ -990,9 +1008,12 @@ impl Device {
         let Self(device) = self;
         let image = unsafe {
             let mut image_id = MaybeUninit::uninit();
-            daxa_sys::daxa_dvc_create_image(*device, &mut mem::transmute(info), image_id.as_mut_ptr());
+            daxa_sys::daxa_dvc_create_image(
+                *device,
+                &mut mem::transmute(info),
+                image_id.as_mut_ptr(),
+            );
             image_id.assume_init()
-
         };
         ImageId(image)
     }
@@ -1129,7 +1150,6 @@ impl Device {
             let mut swapchain = MaybeUninit::uninit();
             let result =
                 daxa_sys::daxa_dvc_create_swapchain(*device, &info, swapchain.as_mut_ptr());
-            dbg!(result);
             swapchain.assume_init()
         };
         Swapchain(swapchain)
@@ -1478,11 +1498,11 @@ pub enum Format {
 }
 #[derive(Clone, Copy)]
 pub struct Swapchain(daxa_sys::daxa_Swapchain);
+unsafe impl Send for Swapchain {}
 
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct ImageId(daxa_sys::daxa_ImageId);
-
 
 impl Hash for ImageId {
     fn hash<H: Hasher>(&self, state: &mut H) {
@@ -1511,10 +1531,10 @@ impl Swapchain {
         unsafe { BinarySemaphore(daxa_sys::daxa_swp_current_acquire_semaphore(self.0).read()) }
     }
     pub fn gpu_timeline_semaphore(&self) -> TimelineSemaphore {
-        unsafe { TimelineSemaphore(daxa_sys::daxa_swp_gpu_timeline_semaphore(self.0).read() )}
+        unsafe { TimelineSemaphore(daxa_sys::daxa_swp_gpu_timeline_semaphore(self.0).read()) }
     }
     pub fn current_cpu_timeline_value(&self) -> u64 {
-        unsafe { daxa_sys::daxa_swp_current_cpu_timeline_value(self.0)}
+        unsafe { daxa_sys::daxa_swp_current_cpu_timeline_value(self.0) }
     }
     pub fn get_format(&self) -> Format {
         unsafe { mem::transmute(daxa_sys::daxa_swp_get_format(self.0)) }
@@ -1984,7 +2004,6 @@ impl GlslangFileIncluder {
                 potential_path.push(name);
                 potential_path
             })
-            .map(|x| dbg!(x))
             .filter(|path| fs::metadata(&path).is_ok())
             .next()
     }
@@ -2002,6 +2021,8 @@ pub struct PipelineCompilerInfo {
 //in many situations
 #[derive(Clone)]
 pub struct PipelineCompiler(Arc<Mutex<PipelineCompilerInner>>);
+
+unsafe impl Send for PipelineCompiler {}
 
 pub enum ShaderCode {
     Vertex(String),
@@ -2109,7 +2130,6 @@ impl PipelineCompiler {
         for dir in include_directories {
             let mut path = dir.clone();
             path.push(name.to_string());
-            dbg!(&path);
             let exists = fs::metadata(path.clone()).is_ok();
             if exists {
                 return fs::read_to_string(path).unwrap();
@@ -2186,7 +2206,7 @@ impl PipelineCompiler {
             name,
         };
 
-        //magical construction of daxa-rs device
+        //magical construction of daxa device
         let raster_pipeline = Device(compiler.daxa_device).create_raster_pipeline(info);
 
         let raster_index = compiler.raster.len() as u64;
@@ -2285,12 +2305,16 @@ impl From<ImageAccess> for ImageLayout {
             ImageAccess::TessellationControlShaderStorageWriteOnly => ImageLayout::General,
             ImageAccess::TessellationControlShaderStorageReadOnly => ImageLayout::General,
             ImageAccess::TessellationControlShaderStorageReadWrite => ImageLayout::General,
-            ImageAccess::TessellationControlShaderStorageReadWriteConcurrent => ImageLayout::General,
+            ImageAccess::TessellationControlShaderStorageReadWriteConcurrent => {
+                ImageLayout::General
+            }
             ImageAccess::TessellationEvaluationShaderSampled => ImageLayout::ShaderReadOnlyOptimal,
             ImageAccess::TessellationEvaluationShaderStorageWriteOnly => ImageLayout::General,
             ImageAccess::TessellationEvaluationShaderStorageReadOnly => ImageLayout::General,
             ImageAccess::TessellationEvaluationShaderStorageReadWrite => ImageLayout::General,
-            ImageAccess::TessellationEvaluationShaderStorageReadWriteConcurrent => ImageLayout::General,
+            ImageAccess::TessellationEvaluationShaderStorageReadWriteConcurrent => {
+                ImageLayout::General
+            }
             ImageAccess::GeometryShaderSampled => ImageLayout::ShaderReadOnlyOptimal,
             ImageAccess::GeometryShaderStorageWriteOnly => ImageLayout::General,
             ImageAccess::GeometryShaderStorageReadOnly => ImageLayout::General,
@@ -2315,7 +2339,6 @@ impl From<ImageAccess> for ImageLayout {
         }
     }
 }
-
 
 #[repr(u32)]
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
@@ -2432,17 +2455,20 @@ impl TaskBuffer {
     }
 }
 #[derive(Clone)]
-pub struct TaskImage(Arc<Mutex<Vec<ImageId>>>);
+pub enum TaskImage {
+    Swapchain,
+    Id(Arc<Mutex<Vec<ImageId>>>),
+}
 impl TaskImage {
     pub fn new(iter: impl IntoIterator<Item = ImageId>) -> Self {
-        Self(Arc::new(Mutex::new(iter.into_iter().collect())))
+        Self::Id(Arc::new(Mutex::new(iter.into_iter().collect())))
     }
     pub fn set(&mut self, iter: impl IntoIterator<Item = ImageId>) {
-        let Self(mutex) = self;
+        let Self::Id(mutex) = self else { panic!("?") };
         *mutex.lock().unwrap() = iter.into_iter().collect();
     }
     pub fn image_ids(&self) -> impl IntoIterator<Item = ImageId> {
-        let Self(mutex) = self;
+        let Self::Id(mutex) = self else { panic!("?") };
         mutex.lock().unwrap().clone()
     }
 }
@@ -2737,12 +2763,12 @@ impl From<MemoryAccess> for Access {
             },
             MemoryAccess::AccelerationStructureBuildReadWrite => Access {
                 stage: PipelineStageFlags::ACCELERATION_STRUCTURE_BUILD_KHR,
-                flags: AccessFlags::ACCELERATION_STRUCTURE_READ_KHR | AccessFlags::ACCELERATION_STRUCTURE_WRITE_KHR,
+                flags: AccessFlags::ACCELERATION_STRUCTURE_READ_KHR
+                    | AccessFlags::ACCELERATION_STRUCTURE_WRITE_KHR,
             },
         }
     }
 }
-
 
 impl MemoryAccess {
     pub fn read(&self) -> bool {
@@ -3574,7 +3600,6 @@ impl From<ImageAccess> for Access {
     }
 }
 
-
 impl ImageAccess {
     pub(crate) fn read(&self) -> bool {
         match self {
@@ -3723,9 +3748,21 @@ pub trait Task: 'static {
     fn record(&mut self, ctx: TaskCommandContext<'_>);
 }
 
-
+#[derive(Clone, Copy)]
+pub enum PseudoPipelineBarrier {
+    Memory {
+        src: Access,
+        dst: Access,
+    },
+    ImageTransition {
+        src: (Access, ImageLayout),
+        dst: (Access, ImageLayout),
+        image_slice: ImageMipArraySlice,
+        image_id: PseudoImageId,
+    },
+}
 pub struct Batch {
-    barriers: Vec<PipelineBarrier>,
+    barriers: Vec<PseudoPipelineBarrier>,
     task_ids: Vec<usize>,
 }
 
@@ -3739,22 +3776,28 @@ pub struct TaskGraph {
 
 impl TaskGraph {
     pub fn execute(&mut self, info: crate::ExecutionInfo<'_>) -> ExecutableCommandList {
-            let mut usages = Usages::default();
+        let mut usages = Usages::default();
 
-            for task in &mut self.tasks {
-                task.prepare(&info);
-                usages.buffer_ids.extend(filter_buffer_uses(&**task).iter().map(|(x, y)| *x));
-                usages.image_ids.extend(filter_image_uses(&**task).iter().map(|(x, y)| *x));
-            }
+        for task in &mut self.tasks {
+            task.prepare(&info);
+            usages
+                .buffer_ids
+                .extend(filter_buffer_uses(&**task).iter().map(|(x, y)| *x));
+            usages
+                .image_ids
+                .extend(filter_image_uses(&**task).iter().map(|(x, y)| *x));
+        }
 
         loop {
-            let permutation = self.permutations.iter_mut().find(|perm| perm.usages == usages);
+            let permutation = self
+                .permutations
+                .iter_mut()
+                .find(|perm| perm.usages == usages);
 
             match permutation {
                 Some(mut perm) => break perm.execute(info, &mut self.tasks),
                 None => {
                     self.permutations.push(Permutation::default());
-                    dbg!("creating new permutation...");
                     for (i, task) in self.tasks.iter().enumerate() {
                         self.permutations.last_mut().unwrap().add_task(&**task, i);
                     }
@@ -3773,16 +3816,23 @@ impl TaskGraph {
 #[derive(Default, PartialEq, Eq)]
 pub struct Usages {
     buffer_ids: HashSet<BufferId>,
-    image_ids: HashSet<ImageId>,
+    image_ids: HashSet<PseudoImageId>,
 }
+
+#[derive(Hash, PartialEq, Eq, Clone, Copy)]
+pub enum PseudoImageId {
+    Id(ImageId),
+    Swapchain,
+}
+
 #[derive(Default)]
 pub struct Permutation {
     batches: Vec<Batch>,
     task_buffers: Vec<TaskBuffer>,
     buffer_last_use: HashMap<BufferId, (BatchId, MemoryAccess)>,
     task_images: Vec<TaskImage>,
-    image_last_use: HashMap<ImageId, (BatchId, ImageAccess)>,
-    usages: Usages
+    image_last_use: HashMap<PseudoImageId, (BatchId, ImageAccess)>,
+    usages: Usages,
 }
 
 pub struct TaskCommandContext<'a> {
@@ -3813,19 +3863,24 @@ pub struct ExecutionInfo<'a> {
 }
 
 impl Permutation {
-    pub fn execute(&mut self, info: ExecutionInfo<'_>, tasks: &mut [Box<dyn Task>]) -> ExecutableCommandList {
-        let mut command_recorder = info.device.create_command_recorder(CommandRecorderInfo::default());
+    pub fn execute(
+        &mut self,
+        info: ExecutionInfo<'_>,
+        tasks: &mut [Box<dyn Task>],
+    ) -> ExecutableCommandList {
+        let mut command_recorder = info
+            .device
+            .create_command_recorder(CommandRecorderInfo::default());
 
         for batch in &mut self.batches {
             for barrier in &batch.barriers {
-                command_recorder.pipeline_barrier(barrier.clone());
-                dbg!("barrier");
+                command_recorder.pipeline_barrier(barrier.clone().into());
             }
             for task_id in &batch.task_ids {
                 tasks[*task_id].record(TaskCommandContext {
-            execution_info: info.clone(),
-            command_recorder: &mut command_recorder,
-        });
+                    execution_info: info.clone(),
+                    command_recorder: &mut command_recorder,
+                });
             }
         }
 
@@ -3892,12 +3947,10 @@ impl Permutation {
             }
             None => {
                 match self.batches.len() {
-                    0 => {
-                        self.batches.push(Batch {
-                            task_ids: vec![task_id],
-                            barriers: vec![],
-                        })
-                    },
+                    0 => self.batches.push(Batch {
+                        task_ids: vec![task_id],
+                        barriers: vec![],
+                    }),
                     _ => {
                         self.batches[0].task_ids.push(task_id);
                     }
@@ -3908,45 +3961,58 @@ impl Permutation {
 
         for (buffer, access) in buffers {
             self.usages.buffer_ids.insert(buffer);
-            let Some((prev_batch, prev_access)) = self.buffer_last_use.insert(buffer, (batch, access)) else {
+            let Some((prev_batch, prev_access)) =
+                self.buffer_last_use.insert(buffer, (batch, access))
+            else {
                 continue;
             };
-            self.batches[batch].barriers.push(PipelineBarrier::Memory {
-                src: prev_access.into(),
-                dst: access.into()
-            });
+            self.batches[batch]
+                .barriers
+                .push(PseudoPipelineBarrier::Memory {
+                    src: prev_access.into(),
+                    dst: access.into(),
+                });
         }
 
         for (image, access) in images {
             self.usages.image_ids.insert(image);
-            let (prev_batch, prev_access) = match self.image_last_use.insert(image, (batch, access)) {
+            let (prev_batch, prev_access) = match self.image_last_use.insert(image, (batch, access))
+            {
                 Some(x) => x,
-                None => (0, ImageAccess::None)
+                None => (0, ImageAccess::None),
             };
-            self.batches[batch].barriers.push(PipelineBarrier::ImageTransition {
-                src: (prev_access.into(), prev_access.into()),
-                dst: (access.into(), access.into()),
-                image_slice: Default::default(),
-                image_id: image,
-            });
-
+            self.batches[batch]
+                .barriers
+                .push(PseudoPipelineBarrier::ImageTransition {
+                    src: (prev_access.into(), prev_access.into()),
+                    dst: (access.into(), access.into()),
+                    image_slice: Default::default(),
+                    image_id: image,
+                });
         }
     }
 }
 fn filter_buffer_uses(task: &dyn Task) -> HashMap<BufferId, MemoryAccess> {
     task.usage()
-            .iter()
-            .filter(|usage| matches!(usage, Use::Buffer(_, _)))
-            .map(|x| x.buffer())
-            .flat_map(|(x, y)| x.buffer_ids().into_iter().map(move |x| (x, y)))
-            .collect::<HashMap<_, _>>()
+        .iter()
+        .filter(|usage| matches!(usage, Use::Buffer(_, _)))
+        .map(|x| x.buffer())
+        .flat_map(|(x, y)| x.buffer_ids().into_iter().map(move |x| (x, y)))
+        .collect::<HashMap<_, _>>()
 }
 
-fn filter_image_uses(task: &dyn Task) -> HashMap<ImageId, ImageAccess> {
+fn filter_image_uses(task: &dyn Task) -> HashMap<PseudoImageId, ImageAccess> {
     task.usage()
-            .iter()
-            .filter(|usage| matches!(usage, Use::Image(_, _)))
-            .map(|x| x.image())
-            .flat_map(|(x, y)| x.image_ids().into_iter().map(move |x| (x, y)))
-            .collect::<HashMap<_, _>>()
+        .iter()
+        .filter(|usage| matches!(usage, Use::Image(_, _)))
+        .map(|x| x.image())
+        .flat_map(|(x, y)| match x {
+            TaskImage::Swapchain => vec![(PseudoImageId::Swapchain, y)],
+            x => x
+                .image_ids()
+                .into_iter()
+                .map(move |x| (PseudoImageId::Id(x), y))
+                .collect::<Vec<_>>(),
+        })
+        .collect::<HashMap<_, _>>()
 }

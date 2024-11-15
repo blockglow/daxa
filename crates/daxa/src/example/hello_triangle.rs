@@ -2,8 +2,8 @@
 
 mod hello_triangle_shared;
 
-use daxa_rs::device_selector::best_gpu;
-use daxa_rs::{
+use daxa::device_selector::best_gpu;
+use daxa::{
     AttachmentLoadOp, AttachmentStoreOp, BinarySemaphore, BinarySemaphoreInfo, ClearColorValue,
     ClearValue, CommandRecorderInfo, CommandSubmitInfo, Device, DeviceInfo, Extent, FixedList,
     ImageLayout, ImageMipArraySlice, ImageViewInfo, ImageViewType, Instance, InstanceFlags,
@@ -33,6 +33,7 @@ use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::platform::run_on_demand::EventLoopExtRunOnDemand;
 use winit::window::{Window, WindowAttributes, WindowId};
+use daxa::{AttachmentLoadOp, AttachmentStoreOp, BinarySemaphoreInfo, ClearColorValue, ClearValue, CommandRecorderInfo, CommandSubmitInfo, Device, DeviceInfo, Extent, ImageLayout, ImageMipArraySlice, ImageViewInfo, ImageViewType, Instance, InstanceInfo, Offset, PipelineShaderStageCreateFlags, PipelineStageFlags, PresentInfo, RasterPipeline, RasterPipelineInfo, Rect, RenderAttachment, RenderAttachmentInfo, RenderPassBeginInfo, ShaderInfo, Swapchain, SwapchainInfo, Viewport};
 
 struct App {
     window: Option<Window>,
@@ -84,7 +85,7 @@ fn daxa(window: &impl HasWindowHandle) -> Daxa {
         .lock()
         .unwrap()
         .include_directories
-        .push("/home/solmidnight/work/daxa/daxa-rs/crates/daxa-rs/src/example/".into());
+        .push("/home/solmidnight/work/daxa/daxa/crates/daxa/src/example/".into());
 
     let instance = Instance::new(InstanceInfo {
         app_name: b"hello-triangle-example".into(),
